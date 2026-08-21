@@ -1,3 +1,41 @@
+# sdrpp-airband
+
+A modified version of [SDR++](https://github.com/AlexandreRouma/SDRPlusPlus), focused on adaptive
+squelch and noise reduction for the VHF aviation band.
+
+> **Modification notice (GPL-3.0, section 5a)**
+>
+> This is a modified version of SDR++, originally created by Alexandre Rouma and licensed under the
+> GNU General Public License version 3. This repository contains modifications made from 2026-08-21
+> onward.
+>
+> This project is **not** affiliated with, endorsed by, or supported by the SDR++ project or its
+> author. Do not report issues with this software to the upstream project.
+>
+> The original source is available at https://github.com/AlexandreRouma/SDRPlusPlus. This work is
+> likewise licensed under the GNU General Public License version 3; see [`license`](license) for the
+> full text.
+
+## What is different here
+
+Nothing yet. The design work is complete and implementation has not started. See
+[`docs/adaptive-squelch/`](docs/adaptive-squelch/) for the specification and the implementation plan.
+
+Planned, in order:
+
+1. An adaptive squelch that estimates the channel noise floor over time, replacing the fixed-level
+   power squelch. Implements the `SQUELCH_MODE_SNR` mode that upstream defined but left unimplemented.
+2. Carrier detection for full-carrier AM, for the aviation band specifically.
+3. Noise reduction for AM audio, which upstream does not currently provide for that mode.
+
+## Building
+
+Build instructions are unchanged from upstream and are reproduced in the original README below.
+
+---
+
+*The original SDR++ README follows, unmodified.*
+
 # SDR++, The bloat-free SDR software<br>
 
 ![Screenshot](https://i.imgur.com/Ter2MQJ.png)
