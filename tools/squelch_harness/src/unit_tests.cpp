@@ -535,6 +535,62 @@ TEST(gate_reset_returns_to_closed_and_silent) {
     CHECK_NEAR(g.nextGain(), 0.0, 1e-6);
 }
 
+#include <dsp/noise_reduction/adaptive_squelch/diagnostics.h>
+#include <thread>
+#include <atomic>
+
+using dsp::noise_reduction::adaptive::Diagnostics;
+using dsp::noise_reduction::adaptive::DiagnosticsPublisher;
+
+TEST(diagnostics_round_trips) {
+    DiagnosticsPublisher p;
+    Diagnostics d;
+    d.framePowerDb = -61.5f;
+    d.noiseFloorDb = -72.25f;
+    d.snrDb = 10.75f;
+    d.occupancy = 0.31f;
+    d.state = (int)GATE_OPEN;
+    d.lastTransitionReason = 3;
+    p.publish(d);
+
+    Diagnostics r = p.read();
+    CHECK_NEAR(r.framePowerDb, -61.5, 1e-6);
+    CHECK_NEAR(r.noiseFloorDb, -72.25, 1e-6);
+    CHECK_NEAR(r.snrDb, 10.75, 1e-6);
+    CHECK_NEAR(r.occupancy, 0.31, 1e-6);
+    CHECK_EQ(r.state, (int)GATE_OPEN);
+    CHECK_EQ(r.lastTransitionReason, 3);
+}
+
+TEST(diagnostics_reader_never_observes_a_torn_snapshot) {
+    // The writer publishes internally consistent snapshots where snrDb is always
+    // exactly framePowerDb minus noiseFloorDb. A torn read would break that.
+    DiagnosticsPublisher p;
+    std::atomic<bool> stop{ false };
+    std::atomic<int> torn{ 0 };
+
+    std::thread writer([&]() {
+        for (int i = 0; i < 200000 && !stop.load(); i++) {
+            Diagnostics d;
+            d.framePowerDb = (float)(-100 + (i % 50));
+            d.noiseFloorDb = (float)(-120 + (i % 50));
+            d.snrDb = d.framePowerDb - d.noiseFloorDb;
+            d.state = i % 4;
+            p.publish(d);
+        }
+        stop.store(true);
+    });
+
+    while (!stop.load()) {
+        Diagnostics r = p.read();
+        if (std::fabs((r.framePowerDb - r.noiseFloorDb) - r.snrDb) > 1e-3f) {
+            torn.fetch_add(1);
+        }
+    }
+    writer.join();
+    CHECK_EQ(torn.load(), 0);
+}
+
 int main() {
     return tf::runAll();
 }
