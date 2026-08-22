@@ -67,6 +67,7 @@ option(OPT_BUILD_RIGCTL_CLIENT "Rigctl client to make SDR++ act as a panadapter"
 option(OPT_BUILD_RIGCTL_SERVER "Rigctl backend for controlling SDR++ with software like gpredict" ON)
 option(OPT_BUILD_SCANNER "Frequency scanner" ON)
 option(OPT_BUILD_SCHEDULER "Build the scheduler" OFF)
+option(OPT_BUILD_SQUELCH_HARNESS "Build the offline adaptive-squelch test harness (developer tool)" OFF)
 
 # Other options
 option(USE_INTERNAL_LIBCORRECT "Use an internal version of libcorrect" ON)
@@ -341,6 +342,10 @@ endif (OPT_BUILD_SCANNER)
 if (OPT_BUILD_SCHEDULER)
 add_subdirectory("misc_modules/scheduler")
 endif (OPT_BUILD_SCHEDULER)
+
+if (OPT_BUILD_SQUELCH_HARNESS)
+    add_subdirectory("tools/squelch_harness")
+endif (OPT_BUILD_SQUELCH_HARNESS)
 
 if (MSVC)
     add_executable(sdrpp "src/main.cpp" "win32/resources.rc")
