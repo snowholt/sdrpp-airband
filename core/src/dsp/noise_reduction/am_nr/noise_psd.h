@@ -200,6 +200,13 @@ namespace dsp::noise_reduction::amnr {
 
         float occupancy() const { return _occupancy; }
 
+        // The smoothed periodogram the tracker itself runs on. The gain rule
+        // must consume the same signal: raw per-frame powers of active speech
+        // are chi-square distributed over enormous dynamic range, and letting
+        // the enhancement react to them gates speech components on and off
+        // within syllables.
+        const std::vector<float>& smoothedPower() const { return _s; }
+
     private:
         void writeSmoothed(float* noisePsdOut) {
             // Frequency smoothing: 3-tap weighted average with indices hard

@@ -170,7 +170,10 @@ namespace dsp::noise_reduction {
 
             if (_tracker.reliable()) {
                 _everActive = true;
-                _rule.process(_magSq.data(), _psd.data(), _gains.data());
+                // The rule consumes the tracker's smoothed periodogram, not
+                // the raw frame powers: chi-square fluctuations of active
+                // speech must not gate enhancement within syllables.
+                _rule.process(_tracker.smoothedPower().data(), _psd.data(), _gains.data());
                 for (int k = 0; k < b; k++) {
                     const float g = _gains[(size_t)k];
                     lSpec[k][0] *= g;
