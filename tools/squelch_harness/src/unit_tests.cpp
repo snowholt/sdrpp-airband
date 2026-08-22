@@ -897,6 +897,94 @@ TEST(scorer_measures_false_open_time) {
     CHECK_NEAR(s.falseOpenFrac, 0.10, 1e-6);
 }
 
+#include "wav_io.h"
+
+TEST(wav_pcm16_round_trip_is_byte_exact) {
+    // Known vector spanning most of the PCM16 range. Kept inside +/-0.95:
+    // this test measures quantization error, not clipping behaviour, which
+    // has its own check below. Worst-case round-trip error through
+    // round(v*32767)/32768 is 1.5/32768 near full scale.
+    std::vector<float> in(1000);
+    sg::Rng rng(5);
+    for (auto& v : in) {
+        do { v = rng.gaussian() * 0.4f; } while (v < -0.95f || v > 0.95f);
+    }
+    in[0] = 0.0f; in[1] = 0.9999f; in[2] = -0.9999f;
+
+    const char* path = "/tmp/squelch_wav_test_pcm16.wav";
+    CHECK(ag::writePcm16(path, in, 48000));
+
+    ag::WavData out = ag::read(path);
+    CHECK(out.ok);
+    CHECK_EQ((int)out.samples.size(), (int)in.size());
+    CHECK_EQ(out.rate, 48000);
+    for (size_t i = 0; i < in.size(); i++) {
+        CHECK_NEAR(out.samples[i], in[i], 1.6f / 32768.0f);
+    }
+    std::remove(path);
+}
+
+TEST(wav_pcm16_clips_out_of_range_inputs) {
+    // Out-of-range values are clamped, never wrapped or left unguarded.
+    std::vector<float> in{ 0.0f, 2.0f, -2.0f };
+    const char* path = "/tmp/squelch_wav_test_clip.wav";
+    CHECK(ag::writePcm16(path, in, 8000));
+
+    ag::WavData out = ag::read(path);
+    CHECK(out.ok);
+    CHECK_EQ((int)out.samples.size(), 3);
+    CHECK_NEAR(out.samples[0], 0.0, 1e-9);
+    CHECK_NEAR(out.samples[1], 32767.0 / 32768.0, 1e-9);
+    CHECK_NEAR(out.samples[2], -32767.0 / 32768.0, 1e-9);
+    std::remove(path);
+}
+
+TEST(wav_float_round_trip_is_exact) {
+    std::vector<float> in(777);
+    sg::Rng rng(9);
+    for (auto& v : in) { v = rng.gaussian() * 0.7f; }
+
+    const char* path = "/tmp/squelch_wav_test_f32.wav";
+    CHECK(ag::writeFloat32(path, in, 44100));
+
+    ag::WavData out = ag::read(path);
+    CHECK(out.ok);
+    CHECK_EQ((int)out.samples.size(), (int)in.size());
+    CHECK_EQ(out.rate, 44100);
+    bool exact = true;
+    for (size_t i = 0; exact && i < in.size(); i++) {
+        if (out.samples[i] != in[i]) { exact = false; }
+    }
+    CHECK(exact);
+    std::remove(path);
+}
+
+TEST(wav_read_rejects_truncated_file) {
+    const char* path = "/tmp/squelch_wav_test_trunc.wav";
+    std::vector<float> in(500, 0.25f);
+    CHECK(ag::writePcm16(path, in, 16000));
+
+    // Keep only the RIFF header plus a few bytes: the data chunk claims far
+    // more payload than the file holds.
+    {
+        std::FILE* f = std::fopen(path, "rb");
+        CHECK(f != NULL);
+        std::vector<char> head(60);
+        size_t n = std::fread(head.data(), 1, head.size(), f);
+        std::fclose(f);
+        head.resize(n);
+
+        std::FILE* g = std::fopen(path, "wb");
+        std::fwrite(head.data(), 1, head.size(), g);
+        std::fclose(g);
+    }
+
+    ag::WavData out = ag::read(path);
+    CHECK(!out.ok);
+    CHECK(!out.err.empty());
+    std::remove(path);
+}
+
 int main() {
     return tf::runAll();
 }
