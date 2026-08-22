@@ -1278,6 +1278,193 @@ TEST(bandpass_reset_clears_history) {
     }
 }
 
+#include <dsp/noise_reduction/am_nr/stft.h>
+
+using dsp::noise_reduction::amnr::StftEngine;
+using dsp::noise_reduction::amnr::StereoFrameListener;
+
+// Passthrough listener: exercises the raw analysis-resynthesis loop.
+class PassthroughListener : public StereoFrameListener {
+public:
+    void processFrame(fftwf_complex* l, fftwf_complex* r) override {
+        (void)l; (void)r;
+    }
+};
+
+// Drives a whole input through the engine in fixed chunks. With flush=true,
+// extra silence follows so trailing finalised samples leave the buffers;
+// note this also appends the flushed silence itself to the output, since the
+// engine cannot distinguish end-of-stream from a pause. Tests choose
+// whichever convention suits their assertions.
+static std::vector<dsp::stereo_t> stftRunAll(StftEngine& e,
+                                             const std::vector<dsp::stereo_t>& in,
+                                             int chunkSize,
+                                             bool flush) {
+    std::vector<dsp::stereo_t> got;
+    std::vector<dsp::stereo_t> scratch(in.size() + 4096);
+    for (long pos = 0; pos < (long)in.size(); pos += chunkSize) {
+        int take = chunkSize;
+        if (pos + take > (long)in.size()) { take = (int)((long)in.size() - pos); }
+        int emitted = e.process(take, in.data() + pos, scratch.data());
+        got.insert(got.end(), scratch.begin(), scratch.begin() + emitted);
+    }
+    if (flush) {
+        const dsp::stereo_t zero{ 0.0f, 0.0f };
+        for (int i = 0; i < 64; i++) {
+            int emitted = e.process(chunkSize, &zero, scratch.data());
+            if (emitted <= 0) { break; }
+            got.insert(got.end(), scratch.begin(), scratch.begin() + emitted);
+        }
+    }
+    return got;
+}
+
+TEST(stft_frame_size_follows_samplerate) {
+    PassthroughListener pl;
+    StftEngine e;
+    e.init(&pl, 48000.0);
+    CHECK_EQ(e.frameSize(), 512);
+    CHECK_EQ(e.hop(), 256);
+    CHECK_EQ(e.bins(), 257);
+    CHECK_EQ(e.latencySamples(), e.frameSize() - e.hop());
+
+    e.setSamplerate(24000.0);
+    CHECK_EQ(e.frameSize(), 256);
+    CHECK_EQ(e.hop(), 128);
+}
+
+TEST(stft_unity_roundtrip_reconstructs_the_input) {
+    const double fs = 48000.0;
+    const long n = (long)fs * 2;
+    PassthroughListener pl;
+    StftEngine e;
+    e.init(&pl, fs);
+
+    sg::Rng rng(23);
+    std::vector<dsp::stereo_t> in((size_t)n);
+    for (long i = 0; i < n; i++) {
+        float speechish = 0.2f * std::sin(6.283185307179586 * 800.0 * (double)i / fs)
+                        + 0.1f * std::sin(6.283185307179586 * 1900.0 * (double)i / fs)
+                        + 0.05f * rng.gaussian();
+        in[(size_t)i] = dsp::stereo_t{ speechish, speechish };
+    }
+
+    // Feed in hop-sized chunks; collect whatever comes out.
+    std::vector<dsp::stereo_t> got = stftRunAll(e, in, e.hop(), false);
+
+    // The overlap-add reconstruction is time-ALIGNED: output index j holds
+    // input index j, once that sample has been finalised. A stream fed to
+    // completion without flushing therefore emits exactly its length minus
+    // one hop - the newest hop cannot be finalised without future input,
+    // because finalisation always waits for the frame that starts hop later
+    // than the sample.
+    const long lat = e.latencySamples();
+    CHECK_EQ(lat, e.frameSize() - e.hop());
+    // Chosen length is hop-aligned: emission stops exactly one hop short.
+    CHECK_EQ((int)got.size(), (int)(n - e.hop()));
+    double sigPow = 0.0, errPow = 0.0;
+    long compared = 0;
+    // The very first hop has single-lobe coverage - its partner window would
+    // start before the stream - so output fades in there like every streaming
+    // STFT does. Comparison starts after that warm-up region.
+    for (long i = e.hop(); i < (long)got.size(); i++) {
+        double d = (double)got[(size_t)i].l - (double)in[(size_t)i].l;
+        errPow += d * d;
+        sigPow += (double)in[(size_t)i].l * in[(size_t)i].l;
+        compared++;
+    }
+    CHECK(compared > n / 2);
+    CHECK(sigPow > 0.0);
+    CHECK(std::sqrt(errPow / sigPow) < 2e-4);
+}
+
+TEST(stft_output_is_independent_of_chunking) {
+    const double fs = 48000.0;
+    const long n = (long)fs;
+    PassthroughListener pl;
+
+    sg::Rng rng(41);
+    std::vector<dsp::stereo_t> in((size_t)n);
+    for (auto& s : in) { s = dsp::stereo_t{ rng.gaussian() * 0.05f, rng.gaussian() * 0.05f }; }
+
+    StftEngine whole;
+    whole.init(&pl, fs);
+    std::vector<dsp::stereo_t> outW = stftRunAll(whole, in, (int)n, false);
+
+    StftEngine chunked;
+    chunked.init(&pl, fs);
+    std::vector<dsp::stereo_t> outC;
+    {
+        sg::Rng chunkRng(77);
+        std::vector<dsp::stereo_t> scratch((size_t)n);
+        long pos = 0;
+        while (pos < n) {
+            int take = 1 + (int)(chunkRng.uniform() * 8192.0f);
+            if (pos + take > n) { take = (int)(n - pos); }
+            int emitted = chunked.process(take, in.data() + pos, scratch.data());
+            outC.insert(outC.end(), scratch.begin(), scratch.begin() + emitted);
+            pos += take;
+        }
+    }
+
+    // Neither path is flushed, so each stops at its own finalised frontier
+    // and the retained tail differs by chunking. Emission order is
+    // deterministic, so the common prefix must be bitwise identical, and
+    // neither side may lose more than one frame's worth of output.
+    const size_t common = std::min(outW.size(), outC.size());
+    CHECK(common >= (size_t)n - 2 * (size_t)whole.frameSize());
+    bool identical = true;
+    for (size_t i = 0; identical && i < common; i++) {
+        if (outW[i].l != outC[i].l || outW[i].r != outC[i].r) { identical = false; }
+    }
+    CHECK(identical);
+}
+
+TEST(stft_impulse_arrives_at_the_reported_latency) {
+    const double fs = 48000.0;
+    const long n = (long)fs;
+    PassthroughListener pl;
+    StftEngine e;
+    e.init(&pl, fs);
+
+    const long impulsePos = 4096;
+    std::vector<dsp::stereo_t> in((size_t)n, dsp::stereo_t{ 0.0f, 0.0f });
+    in[(size_t)impulsePos] = dsp::stereo_t{ 1.0f, 1.0f };
+    std::vector<dsp::stereo_t> got = stftRunAll(e, in, e.hop(), false);
+
+    // The reconstruction is time-aligned: the impulse reappears at its own
+    // input position. latencySamples() is the availability horizon (how much
+    // newer input finalisation waits for), not a signal displacement.
+    const int expect = (int)impulsePos;
+    int peak = 0;
+    float peakMag = -1.0f;
+    for (long i = 0; i < (long)got.size(); i++) {
+        float m = std::fabs(got[(size_t)i].l);
+        if (m > peakMag) { peakMag = m; peak = (int)i; }
+    }
+    CHECK_EQ(peak, expect);
+    CHECK_NEAR(peakMag, 1.0f, 0.01f);
+}
+
+TEST(stft_reset_clears_overlap_add_state) {
+    const double fs = 48000.0;
+    PassthroughListener pl;
+    StftEngine e;
+    e.init(&pl, fs);
+
+    std::vector<dsp::stereo_t> loud(2048, dsp::stereo_t{ 0.9f, 0.9f });
+    std::vector<dsp::stereo_t> scratch(2048);
+    e.process(2048, loud.data(), scratch.data());
+    e.reset();
+
+    std::vector<dsp::stereo_t> silence(2048, dsp::stereo_t{ 0.0f, 0.0f });
+    int emitted = e.process(2048, silence.data(), scratch.data());
+    // Fresh rings mean the very first output is silence, not a stale tail.
+    for (int i = 0; i < emitted; i++) {
+        CHECK(std::fabs(scratch[(size_t)i].l) < 1e-6f);
+    }
+}
+
 int main() {
     return tf::runAll();
 }
