@@ -1752,6 +1752,224 @@ TEST(gainrule_gain_variance_stays_low_on_stationary_noise) {
     CHECK(mean <= 1.0f);
 }
 
+#include <dsp/noise_reduction/am_nr.h>
+
+using dsp::noise_reduction::AmNR;
+using dsp::noise_reduction::amnr::NR_OFF;
+using dsp::noise_reduction::amnr::NR_WARMUP;
+using dsp::noise_reduction::amnr::NR_ACTIVE;
+using dsp::noise_reduction::amnr::NR_BYPASS_UNRELIABLE;
+
+namespace {
+    // Duplicates a mono vector into both channels.
+    static std::vector<dsp::stereo_t> amnrStereo(const std::vector<float>& mono) {
+        std::vector<dsp::stereo_t> in(mono.size());
+        for (size_t i = 0; i < mono.size(); i++) { in[i] = dsp::stereo_t{ mono[i], mono[i] }; }
+        return in;
+    }
+
+    // Runs a stereo buffer through the block in fixed chunks.
+    static std::vector<dsp::stereo_t> amnrRun(AmNR& nr,
+                                              const std::vector<dsp::stereo_t>& in,
+                                              int chunk) {
+        std::vector<dsp::stereo_t> got;
+        got.reserve(in.size());
+        std::vector<dsp::stereo_t> scratch(in.size() + 8192);
+        for (long pos = 0; pos < (long)in.size(); pos += chunk) {
+            int take = chunk;
+            if (pos + take > (long)in.size()) { take = (int)((long)in.size() - pos); }
+            int emitted = nr.process(take, in.data() + pos, scratch.data());
+            got.insert(got.end(), scratch.begin(), scratch.begin() + emitted);
+        }
+        return got;
+    }
+
+    static std::vector<float> leftOf(const std::vector<dsp::stereo_t>& v) {
+        std::vector<float> m(v.size());
+        for (size_t i = 0; i < v.size(); i++) { m[i] = v[i].l; }
+        return m;
+    }
+}
+
+TEST(amnr_disabled_passes_audio_through_after_priming) {
+    const double fs = 48000.0;
+    AmNR nr;
+    nr.init(NULL, fs);
+    CHECK(nr.nrState() == NR_OFF);
+
+    sg::Rng rng(71);
+    const long n = (long)fs * 2;
+    std::vector<float> mono((size_t)n);
+    for (auto& v : mono) { v = rng.gaussian() * 0.05f; }
+
+    std::vector<dsp::stereo_t> got = amnrRun(nr, amnrStereo(mono), (int)nr.hop());
+    std::vector<float> out = leftOf(got);
+
+    const long lat = nr.latencySamples();
+    double sigPow = 0.0, errPow = 0.0;
+    long cnt = 0;
+    for (long i = lat; i < (long)out.size() && i < n; i++) {
+        const double d = (double)out[(size_t)i] - mono[(size_t)i];
+        errPow += d * d;
+        sigPow += (double)mono[(size_t)i] * mono[(size_t)i];
+        cnt++;
+    }
+    CHECK(cnt > n / 2);
+    CHECK(std::sqrt(errPow / sigPow) < 1e-5);
+    CHECK(nr.nrState() == NR_OFF);   // stays off while disabled
+}
+
+TEST(amnr_states_publish_through_warmup_to_active) {
+    const double fs = 48000.0;
+    AmNR nr;
+    nr.init(NULL, fs);
+    nr.setEnabled(true);
+    CHECK(nr.nrState() == NR_WARMUP);
+
+    // Pure noise: no transmissions, so the tracker converges and stays
+    // reliable.
+    sg::Rng rng(73);
+    const long n = (long)fs * 3;
+    std::vector<float> mono((size_t)n);
+    for (auto& v : mono) { v = 0.02f + rng.gaussian() * 0.01f; }
+
+    std::vector<dsp::stereo_t> got = amnrRun(nr, amnrStereo(mono), (int)nr.hop());
+    CHECK(nr.nrState() == NR_ACTIVE);
+    CHECK((long)got.size() >= n - (long)nr.frameSize());
+
+    nr.setEnabled(false);
+    CHECK(nr.nrState() == NR_OFF);
+}
+
+TEST(amnr_active_reduces_noise_and_keeps_speech_intelligible) {
+    const double fs = 48000.0;
+    AmNR nr;
+    nr.init(NULL, fs);
+    nr.setEnabled(true);
+
+    ag::AudioSceneConfig cfg;
+    cfg.durationSeconds = 20.0;
+    cfg.snrDb = 6.0f;
+    cfg.seed = 7u;
+    ag::AudioScene scene = ag::generate(cfg);
+
+    std::vector<dsp::stereo_t> got = amnrRun(nr, amnrStereo(scene.noisy), (int)scene.noisy.size());
+    std::vector<float> out = leftOf(got);
+
+    // Align on the engine's reported latency before scoring.
+    std::vector<float> aligned(out.begin() + nr.latencySamples(), out.end());
+    aligned.resize(scene.clean.size(), 0.0f);
+
+    const double reduction = metrics::noiseReductionDb(scene.noisy, aligned,
+                                                       scene.txLabels, fs, 0.05);
+    const double fidelity = metrics::inBandFidelityDb(scene.clean, aligned,
+                                                      scene.txLabels, 0);
+    CHECK(nr.nrState() == NR_ACTIVE);
+    CHECK(reduction <= -3.0);
+    CHECK(fidelity >= -1.0);
+}
+
+TEST(amnr_bypasses_when_the_noise_estimate_goes_stale) {
+    const double fs = 48000.0;
+    AmNR nr;
+    nr.init(NULL, fs);
+    nr.setEnabled(true);
+
+    // Two seconds of noise converge the tracker...
+    sg::Rng rng(77);
+    const long warm = (long)fs * 2;
+    std::vector<float> noiseOnly((size_t)warm);
+    for (auto& v : noiseOnly) { v = 0.02f + rng.gaussian() * 0.01f; }
+    amnrRun(nr, amnrStereo(noiseOnly), (int)nr.hop());
+    CHECK(nr.nrState() == NR_ACTIVE);
+
+    // ...then a long transmission with no quiet at all starves it. The
+    // designed response is bypass, and the audio must then be bit-identical
+    // to a disabled run.
+    const long talk = (long)fs * 12;
+    std::vector<float> speech((size_t)talk);
+    for (long i = 0; i < talk; i++) {
+        speech[(size_t)i] = 0.15f * std::sin(6.283185307179586 * 700.0 * (double)i / fs)
+                          + 0.10f * std::sin(6.283185307179586 * 1600.0 * (double)i / fs)
+                          + 0.05f * rng.gaussian();
+    }
+
+    // The reference must see the IDENTICAL full stream - warm-up included -
+    // so its emission timeline matches exactly; it simply stays disabled.
+    AmNR reference;
+    reference.init(NULL, fs);
+    amnrRun(reference, amnrStereo(noiseOnly), (int)nr.hop());
+
+    std::vector<dsp::stereo_t> processed = amnrRun(nr, amnrStereo(speech), (int)nr.hop());
+    std::vector<dsp::stereo_t> plain = amnrRun(reference, amnrStereo(speech), (int)nr.hop());
+    CHECK(nr.nrState() == NR_BYPASS_UNRELIABLE);
+
+    // Era-aware comparison. The first seconds of the transmission ran
+    // legitimately ACTIVE - gains were applied, so that region differs from
+    // passthrough by design. The bit-exactness contract belongs to the
+    // bypass era: compare only the final second, long after staleness.
+    const size_t common = std::min(processed.size(), plain.size());
+    const size_t tail = (size_t)fs;
+    CHECK(common > (size_t)talk / 2);
+    CHECK(common >= tail);
+    bool identical = true;
+    for (size_t i = common - tail; i < common; i++) {
+        if (processed[i].l != plain[i].l || processed[i].r != plain[i].r) { identical = false; }
+    }
+    CHECK(identical);
+}
+
+TEST(amnr_output_is_independent_of_chunking_while_active) {
+    const double fs = 48000.0;
+    ag::AudioSceneConfig cfg;
+    cfg.durationSeconds = 8.0;
+    cfg.snrDb = 10.0f;
+    cfg.seed = 9u;
+    ag::AudioScene scene = ag::generate(cfg);
+    std::vector<dsp::stereo_t> in = amnrStereo(scene.noisy);
+
+    AmNR whole;
+    whole.init(NULL, fs);
+    whole.setEnabled(true);
+    std::vector<dsp::stereo_t> outW = amnrRun(whole, in, (int)in.size());
+
+    AmNR chunked;
+    chunked.init(NULL, fs);
+    chunked.setEnabled(true);
+    std::vector<dsp::stereo_t> outC;
+    {
+        sg::Rng rng(78);
+        std::vector<dsp::stereo_t> scratch(in.size() + 8192);
+        long pos = 0;
+        while (pos < (long)in.size()) {
+            int take = 1 + (int)(rng.uniform() * 4096.0f);
+            if (pos + take > (long)in.size()) { take = (int)((long)in.size() - pos); }
+            int emitted = chunked.process(take, in.data() + pos, scratch.data());
+            outC.insert(outC.end(), scratch.begin(), scratch.begin() + emitted);
+            pos += take;
+        }
+    }
+
+    const size_t common = std::min(outW.size(), outC.size());
+    CHECK(common >= (size_t)in.size() - 2 * (size_t)whole.frameSize());
+    bool identical = true;
+    for (size_t i = 0; identical && i < common; i++) {
+        if (outW[i].l != outC[i].l || outW[i].r != outC[i].r) { identical = false; }
+    }
+    CHECK(identical);
+}
+
+TEST(amnr_frame_timing_follows_samplerate) {
+    AmNR nr48, nr24;
+    nr48.init(NULL, 48000.0);
+    nr24.init(NULL, 24000.0);
+    CHECK(nr48.frameSize() == 512);
+    CHECK(nr48.hop() == 256);
+    CHECK(nr24.frameSize() == 256);
+    CHECK(nr24.latencySamples() == nr24.frameSize() - nr24.hop());
+    CHECK(nr48.latencySamples() == nr48.frameSize() - nr48.hop());
+}
+
 int main() {
     return tf::runAll();
 }
