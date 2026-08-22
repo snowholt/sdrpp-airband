@@ -63,8 +63,11 @@ TEST(scene_cnr_is_approximately_as_requested) {
 }
 
 #include <dsp/noise_reduction/adaptive_squelch/frame_meter.h>
+#include <dsp/noise_reduction/adaptive_squelch/noise_estimator.h>
+#include <limits>
 
 using dsp::noise_reduction::adaptive::FrameMeter;
+using dsp::noise_reduction::adaptive::PercentileEstimator;
 
 TEST(frame_meter_length_follows_samplerate) {
     FrameMeter m;
@@ -154,6 +157,84 @@ TEST(frame_meter_reset_clears_partial_frame) {
     m.reset();
     m.feed(100, in.data(), frames);      // must not complete the earlier frame
     CHECK_EQ((int)frames.size(), 0);
+}
+
+TEST(percentile_bin_indices_are_clamped_at_both_ends) {
+    // SDRPlusPlusBrown issue #73 is an out-of-bounds histogram index bug in
+    // exactly this kind of code. Every input, however absurd, must land inside
+    // the array.
+    const float probes[] = {
+        -1e30f, -1000.0f, -140.5f, -140.0f, -139.9f,
+        -0.1f, 0.0f, 0.1f, 1000.0f, 1e30f,
+        std::nanf(""), -std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity()
+    };
+    for (float p : probes) {
+        int b = PercentileEstimator::binOf(p);
+        CHECK(b >= 0);
+        CHECK(b < PercentileEstimator::BIN_COUNT);
+    }
+    CHECK_EQ(PercentileEstimator::BIN_COUNT, 560);
+}
+
+TEST(percentile_survives_out_of_range_sweep) {
+    PercentileEstimator e;
+    e.init(0.010);
+    sg::Rng rng(11);
+    for (int i = 0; i < 20000; i++) {
+        // Deliberately sweeps far outside the configured dB range at both ends.
+        float db = -400.0f + rng.uniform() * 800.0f;
+        float n = e.update(db, false);
+        CHECK(n >= PercentileEstimator::MIN_DB);
+        CHECK(n <= PercentileEstimator::MAX_DB);
+    }
+}
+
+TEST(percentile_finds_the_noise_floor_of_a_bimodal_stream) {
+    // 70% of frames at -70 dB, 30% at -45 dB. The 20th percentile must report
+    // the lower population.
+    PercentileEstimator e;
+    e.init(0.010);
+    sg::Rng rng(3);
+    float last = 0.0f;
+    for (int i = 0; i < 5000; i++) {
+        float db = (rng.uniform() < 0.7f) ? -70.0f : -45.0f;
+        last = e.update(db, false);
+    }
+    CHECK_NEAR(last, -70.0, 0.5);
+}
+
+TEST(percentile_tracks_a_noise_floor_step_within_the_window) {
+    PercentileEstimator e;
+    e.init(0.010);
+    e.setWindow(2.0);            // 200 frames
+    for (int i = 0; i < 400; i++) { e.update(-80.0f, false); }
+    CHECK_NEAR(e.update(-80.0f, false), -80.0, 0.5);
+    // Step the floor up. After a full window the old population has expired.
+    float n = 0.0f;
+    for (int i = 0; i < 400; i++) { n = e.update(-60.0f, false); }
+    CHECK_NEAR(n, -60.0, 0.5);
+}
+
+TEST(percentile_reports_occupancy) {
+    PercentileEstimator e;
+    e.init(0.010);
+    sg::Rng rng(5);
+    for (int i = 0; i < 5000; i++) {
+        // 40% of frames well above the floor.
+        e.update((rng.uniform() < 0.4f) ? -50.0f : -70.0f, false);
+    }
+    CHECK_NEAR(e.occupancy(), 0.40, 0.05);
+}
+
+TEST(percentile_reset_clears_history) {
+    PercentileEstimator e;
+    e.init(0.010);
+    for (int i = 0; i < 2000; i++) { e.update(-90.0f, false); }
+    e.reset();
+    float n = 0.0f;
+    for (int i = 0; i < 300; i++) { n = e.update(-40.0f, false); }
+    CHECK_NEAR(n, -40.0, 0.5);
 }
 
 int main() {
