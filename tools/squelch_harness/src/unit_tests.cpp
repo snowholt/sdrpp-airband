@@ -811,6 +811,92 @@ TEST(block_switching_artifact_is_smaller_than_power_squelch) {
     CHECK(maxJump(adaptive) < maxJump(naive));
 }
 
+#include "scorer.h"
+
+TEST(scorer_reports_a_perfect_gate_as_perfect) {
+    const double sr = 1000.0;
+    std::vector<char> open(10000, 0);
+    std::vector<sg::Label> labels{ { 2000, 5000 } };
+    for (long i = 2000; i < 5000; i++) { open[(size_t)i] = 1; }
+
+    scorer::Score s = scorer::score(open, labels, sr);
+    CHECK_NEAR(s.falseOpenFrac, 0.0, 1e-9);
+    CHECK_NEAR(s.missFrac, 0.0, 1e-9);
+    CHECK_NEAR(s.fecMs, 0.0, 1e-6);
+    CHECK_NEAR(s.overMs, 0.0, 1e-6);
+    CHECK_EQ(s.mscCount, 0);
+}
+
+TEST(scorer_measures_front_end_clipping_and_overhang) {
+    const double sr = 1000.0;
+    std::vector<char> open(10000, 0);
+    std::vector<sg::Label> labels{ { 2000, 5000 } };
+    // Opens 100 samples late, closes 250 samples late.
+    for (long i = 2100; i < 5250; i++) { open[(size_t)i] = 1; }
+
+    scorer::Score s = scorer::score(open, labels, sr);
+    CHECK_NEAR(s.fecMs, 100.0, 1e-6);
+    CHECK_NEAR(s.overMs, 250.0, 1e-6);
+}
+
+TEST(scorer_counts_mid_speech_clipping) {
+    const double sr = 1000.0;
+    std::vector<char> open(10000, 0);
+    std::vector<sg::Label> labels{ { 2000, 5000 } };
+    for (long i = 2000; i < 5000; i++) { open[(size_t)i] = 1; }
+    for (long i = 3000; i < 3100; i++) { open[(size_t)i] = 0; }
+    for (long i = 4000; i < 4050; i++) { open[(size_t)i] = 0; }
+
+    scorer::Score s = scorer::score(open, labels, sr);
+    CHECK_EQ(s.mscCount, 2);
+}
+
+TEST(preroll_measurably_reduces_front_end_clipping) {
+    // Acceptance criterion 7. Scored through the same path the sweep uses, so
+    // the number means the same thing here as it does in the comparison table.
+    sg::SceneConfig cfg;
+    cfg.durationSeconds = 60.0;
+    cfg.cnrDb = 15.0f;
+    sg::Scene scene = sg::generate(cfg);
+
+    auto measureFec = [&](double preRollSeconds) {
+        AdaptiveSquelch sq;
+        sq.init(NULL, cfg.samplerate);
+        sq.setPreRoll(preRollSeconds);
+
+        std::vector<char> open;
+        open.reserve(scene.iq.size());
+        std::vector<dsp::complex_t> scratch(65536);
+        long pos = 0;
+        while (pos < (long)scene.iq.size()) {
+            int take = 4096;
+            if (pos + take > (long)scene.iq.size()) { take = (int)((long)scene.iq.size() - pos); }
+            int n = sq.process(take, scene.iq.data() + pos, scratch.data());
+            int st = sq.diagnostics().state;
+            char isOpen = (st == (int)dsp::noise_reduction::adaptive::GATE_OPEN ||
+                           st == (int)dsp::noise_reduction::adaptive::GATE_HANG) ? 1 : 0;
+            for (int i = 0; i < n; i++) { open.push_back(isOpen); }
+            pos += take;
+        }
+        return scorer::score(open, scene.labels, cfg.samplerate).fecMs;
+    };
+
+    double withPreRoll = measureFec(0.040);
+    double without = measureFec(0.0);
+    CHECK(withPreRoll < without);
+}
+
+TEST(scorer_measures_false_open_time) {
+    const double sr = 1000.0;
+    std::vector<char> open(10000, 0);
+    std::vector<sg::Label> labels{ { 2000, 5000 } };
+    for (long i = 2000; i < 5000; i++) { open[(size_t)i] = 1; }
+    for (long i = 7000; i < 7700; i++) { open[(size_t)i] = 1; }   // 700 of 7000 idle samples
+
+    scorer::Score s = scorer::score(open, labels, sr);
+    CHECK_NEAR(s.falseOpenFrac, 0.10, 1e-6);
+}
+
 int main() {
     return tf::runAll();
 }

@@ -13,3 +13,12 @@ target_include_directories(squelch_unit_tests PRIVATE
     ${VOLK_INCLUDE_DIRS})
 target_link_directories(squelch_unit_tests PRIVATE ${VOLK_LIBRARY_DIRS})
 target_link_libraries(squelch_unit_tests PRIVATE ${VOLK_LIBRARIES} Threads::Threads)
+
+add_executable(squelch_sweep src/harness_main.cpp)
+target_compile_features(squelch_sweep PRIVATE cxx_std_17)
+target_include_directories(squelch_sweep PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/core/src"
+    ${VOLK_INCLUDE_DIRS})
+target_link_directories(squelch_sweep PRIVATE ${VOLK_LIBRARY_DIRS})
+target_link_libraries(squelch_sweep PRIVATE ${VOLK_LIBRARIES} Threads::Threads)
