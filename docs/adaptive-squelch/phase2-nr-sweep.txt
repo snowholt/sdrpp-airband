@@ -1,0 +1,115 @@
+AM audio-chain evaluation - noise reduction stage (Phase 2b)
+==============================================================
+Date: 2026-08-22
+Plan: implementation-plan-phase2.md task P2-13
+Build: Release (-O3), af_sweep harness target
+
+Method
+------
+Same scene family and in-channel SNR definition as the bandpass
+study. Three conditions: unprocessed, voice bandpass (300-2700),
+bandpass plus capped log-MMSE noise reduction. Exports are aligned
+on waveform displacement - the bandpass group delay only; the STFT
+block is time-aligned by construction.
+
+Results
+-------
+condition   SNR   noiseReddB   fidelitydB  maxJump   ns/sample
+------------------------------------------------------------------
+off        20.0         0.00         0.69   0.1840         4.1
+bp         20.0       -10.13        -0.09   0.0353       130.9
+bp_nr      20.0       -11.27        -0.17   0.0348       250.2
+
+off        15.0         0.00         1.91   0.3268         4.4
+bp         15.0       -10.13         0.06   0.0378       130.1
+bp_nr      15.0       -12.23        -0.32   0.0355       264.2
+
+off        10.0         0.00         4.40   0.5807         3.4
+bp         10.0       -10.13         0.51   0.0435       131.3
+bp_nr      10.0       -17.90        -0.87   0.0430       254.1
+
+off         6.0         0.00         7.35   0.9200         1.6
+bp          6.0       -10.13         1.39   0.0556       128.6
+bp_nr       6.0       -18.88        -5.94   0.0547       238.3
+
+off         0.0         0.00        12.72   1.8351         3.1
+bp          0.0       -10.13         4.22   0.0884       130.5
+bp_nr       0.0       -18.88        -4.33   0.0756       248.9
+
+STOI manifest written to /tmp/phase2_nr_manifest.csv
+
+STOI gate (Taal et al.; shared clean reference; tol 0.01;
+bp_nr is gated against BOTH baselines)
+------------------------------------------------------------
+nr_snr20_bp: STOI=0.9959
+nr_snr20_bp:   vs noisy: 0.9968 -> ok
+nr_snr20_bp_nr: STOI=0.9944
+nr_snr20_bp_nr:   vs bp: 0.9959 -> ok
+nr_snr20_bp_nr:   vs noisy: 0.9968 -> ok
+nr_snr15_bp: STOI=0.9897
+nr_snr15_bp:   vs noisy: 0.9905 -> ok
+nr_snr15_bp_nr: STOI=0.9810
+nr_snr15_bp_nr:   vs bp: 0.9897 -> ok
+nr_snr15_bp_nr:   vs noisy: 0.9905 -> ok
+nr_snr10_bp: STOI=0.9741
+nr_snr10_bp:   vs noisy: 0.9748 -> ok
+nr_snr10_bp_nr: STOI=0.9614
+nr_snr10_bp_nr:   vs bp: 0.9741 -> GATE FAIL
+nr_snr10_bp_nr:   vs noisy: 0.9748 -> GATE FAIL
+nr_snr6_bp: STOI=0.9510
+nr_snr6_bp:   vs noisy: 0.9516 -> ok
+nr_snr6_bp_nr: STOI=0.9410
+nr_snr6_bp_nr:   vs bp: 0.9510 -> ok
+nr_snr6_bp_nr:   vs noisy: 0.9516 -> GATE FAIL
+nr_snr0_bp: STOI=0.8990
+nr_snr0_bp:   vs noisy: 0.9006 -> ok
+nr_snr0_bp_nr: STOI=0.8927
+nr_snr0_bp_nr:   vs bp: 0.8990 -> ok
+nr_snr0_bp_nr:   vs noisy: 0.9006 -> ok
+BATCH VERDICT: FAIL
+
+VERDICT: RELEASE GATE FAIL
+--------------------------
+The noise reduction delivers real hiss suppression that scales with
+difficulty (-11.3 dB total at 20 dB SNR rising to -18.9 dB at 0 dB,
+approaching the 9 dB cap over the bandpass) but costs measurable
+intelligibility exactly where suppression is deepest:
+
+  snr10: STOI 0.961 vs baselines 0.974  (delta -0.013)
+  snr6 : STOI 0.941 vs baseline  0.952  (delta -0.011)
+
+Fidelity agrees: -5.8 dB median in-channel speech power loss at 6 dB.
+Per design section 7 this is a FAILURE, not a trade-off. The feature
+remains opt-in and OFF by default; the gate blocks any default-on
+rollout until a re-measured run passes.
+
+Diagnosis (for the next iteration, not tuned against here)
+----------------------------------------------------------
+1. Decision-directed a priori SNR lags syllable onsets by roughly its
+   50-frame memory, so attack portions of words are attenuated near
+   the cap before xi catches up.
+2. Bins whose speech power sits near the noise floor (spectral
+   valleys, and half of all bins at 6 dB SNR) receive capped
+   attenuation during chi-square dips of their own power.
+Candidate remedies, each required to pass this same gate before
+shipping: presence-conditioned gain softening (IMCRA-style speech
+presence probability blending into the gain), a lower decision-
+direction alpha with a measured musical-noise bound, or an a priori
+SNR floor. Human confirmation via phase2-abx-protocol.md is required
+regardless, per the design's word-recognition requirement.
+
+What did pass
+-------------
+- Voice bandpass alone: gate PASS at every SNR (see
+  phase2-bandpass-sweep.txt).
+- Noise reduction at 15/20 dB SNR: within tolerance.
+- CPU (Release): off ~4 ns/sample, bp ~130, bp_nr ~255 per stereo
+  pair at 48 kHz (~0.5% of one core for the full chain).
+
+Harness corrections made while measuring this stage
+---------------------------------------------------
+- Chained exports were shifted by bp group delay PLUS the STFT block's
+  availability latency; the latter does not displace the waveform and
+  the over-shift smeared phoneme transitions, producing an artificial
+  ten-point STOI collapse at every SNR. Fixed before drawing any
+  conclusion from the numbers above.
