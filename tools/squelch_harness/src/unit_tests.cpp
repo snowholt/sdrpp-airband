@@ -1970,6 +1970,34 @@ TEST(amnr_frame_timing_follows_samplerate) {
     CHECK(nr48.latencySamples() == nr48.frameSize() - nr48.hop());
 }
 
+TEST(psd_converges_to_the_true_mean_of_chi_square_bins) {
+    // Real periodogram bins of white noise are exponentially distributed
+    // (chi-square, two degrees of freedom): mostly small with a long upper
+    // tail. This is the distribution that punishes uncompensated minimum
+    // tracking - the estimate slides to the lower quantile while the mean
+    // sits far above it. The committed minimum must carry enough bias
+    // compensation to land on the true mean.
+    const int bins = 129;
+    const double hopSec = 256.0 / 48000.0;
+    NoisePsdTracker t;
+    t.init(bins, hopSec);
+
+    std::vector<float> magSq((size_t)bins), out((size_t)bins, 0.0f);
+    sg::Rng rng(81);
+    const float mean = 1e-4f;
+    const int frames = (int)(6.0 / hopSec);
+    for (int f = 0; f < frames; f++) {
+        for (auto& v : magSq) {
+            v = mean * (-1.0f * std::log(1.0f - rng.uniform() + 1e-9f));
+        }
+        t.process(magSq.data(), out.data());
+    }
+    for (int k = 5; k < bins - 5; k += 10) {
+        CHECK_NEAR(out[(size_t)k], mean, 0.35f * mean);
+    }
+    CHECK(t.reliable());
+}
+
 int main() {
     return tf::runAll();
 }
