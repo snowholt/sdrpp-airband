@@ -985,6 +985,78 @@ TEST(wav_read_rejects_truncated_file) {
     std::remove(path);
 }
 
+#include "audio_gen.h"
+
+TEST(audio_scene_is_deterministic) {
+    ag::AudioSceneConfig cfg;
+    cfg.durationSeconds = 3.0;
+    ag::AudioScene a = ag::generate(cfg);
+    ag::AudioScene b = ag::generate(cfg);
+    CHECK_EQ((int)a.clean.size(), (int)b.clean.size());
+    bool identical = a.clean.size() == b.clean.size();
+    for (size_t i = 0; identical && i < a.clean.size(); i++) {
+        if (a.clean[i] != b.clean[i] || a.noisy[i] != b.noisy[i]) { identical = false; }
+    }
+    CHECK(identical);
+}
+
+TEST(audio_clean_is_silent_outside_transmissions) {
+    // The clean signal must be exactly zero in the gaps: the ground truth for
+    // "noise only" depends on it.
+    ag::AudioSceneConfig cfg;
+    cfg.durationSeconds = 20.0;
+    ag::AudioScene s = ag::generate(cfg);
+    std::vector<char> active((size_t)s.clean.size(), 0);
+    for (auto& l : s.txLabels) {
+        for (long i = l.start; i < l.end && i < (long)active.size(); i++) { active[(size_t)i] = 1; }
+    }
+    for (size_t i = 0; i < s.clean.size(); i++) {
+        if (!active[i]) { CHECK_EQ(s.clean[i], 0.0f); }
+    }
+}
+
+TEST(audio_measured_active_snr_matches_request) {
+    // With speech only inside word labels and noise everywhere, an estimate
+    // of active SNR is P(word regions) - P(gap regions) over P(gap regions).
+    ag::AudioSceneConfig cfg;
+    cfg.durationSeconds = 30.0;
+    cfg.snrDb = 12.0f;
+    ag::AudioScene s = ag::generate(cfg);
+
+    double wordSum = 0.0, gapSum = 0.0;
+    long wordN = 0, gapN = 0;
+    std::vector<char> word((size_t)s.noisy.size(), 0);
+    for (auto& l : s.wordLabels) {
+        for (long i = l.start; i < l.end && i < (long)word.size(); i++) { word[(size_t)i] = 1; }
+    }
+    for (size_t i = 0; i < s.noisy.size(); i++) {
+        double p = (double)s.noisy[i] * s.noisy[i];
+        if (word[i]) { wordSum += p; wordN++; }
+        else { gapSum += p; gapN++; }
+    }
+    CHECK(gapSum > 0.0);
+    double snrDb = 10.0 * std::log10((wordSum - gapSum) / gapSum);
+    CHECK_NEAR(snrDb, 12.0, 1.5);
+}
+
+TEST(audio_word_labels_nest_inside_transmissions) {
+    ag::AudioSceneConfig cfg;
+    cfg.durationSeconds = 25.0;
+    cfg.wordsPerTx = 4;
+    ag::AudioScene s = ag::generate(cfg);
+
+    CHECK_EQ((int)s.wordLabels.size(), (int)s.txLabels.size() * 4);
+    for (auto& w : s.wordLabels) {
+        bool inside = false;
+        for (auto& t : s.txLabels) {
+            if (w.start >= t.start && w.end <= t.end) { inside = true; break; }
+        }
+        CHECK(inside);
+        // Words are at least 50 ms so they carry something to transcribe.
+        CHECK((w.end - w.start) >= (long)(0.05 * s.rate));
+    }
+}
+
 int main() {
     return tf::runAll();
 }
