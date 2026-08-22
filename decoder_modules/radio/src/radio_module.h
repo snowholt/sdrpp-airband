@@ -14,6 +14,7 @@
 #include <dsp/multirate/rational_resampler.h>
 #include <dsp/filter/deephasis.h>
 #include <dsp/audio/voice_bandpass.h>
+#include <dsp/noise_reduction/am_nr.h>
 #include <core.h>
 #include <stdint.h>
 #include <utils/optionlist.h>
@@ -111,12 +112,14 @@ public:
         hpTaps = dsp::taps::highPass(300.0, 100.0, 48000.0);
         hpf.init(NULL, hpTaps);
         voiceBandpass.init(NULL, audioSampleRate);
+        audioNr.init(NULL, audioSampleRate);
         deemp.init(NULL, 50e-6, 48000.0);
 
         afChain.addBlock(&ctcss, false);
         afChain.addBlock(&resamp, true);
         afChain.addBlock(&hpf, false);
         afChain.addBlock(&voiceBandpass, false);
+        afChain.addBlock(&audioNr, false);
         afChain.addBlock(&deemp, false);
 
         // Initialize the sink
@@ -379,6 +382,29 @@ private:
                                   "Adds about %.0f ms of latency.",
                                   (_this->voiceBandpass.delaySamples() / _this->audioSampleRate) * 1000.0);
             }
+
+            // AM audio noise reduction
+            if (ImGui::Checkbox(("Audio NR##_radio_amnr_" + _this->name).c_str(), &_this->amNoiseReduction)) {
+                _this->setAmNoiseReduction(_this->amNoiseReduction);
+            }
+            if (_this->amNoiseReduction) {
+                int nrst = _this->audioNr.nrState();
+                ImVec4 nrcol = (nrst == dsp::noise_reduction::amnr::NR_ACTIVE)
+                                 ? ImVec4(0, 1, 0, 1)
+                                 : ((nrst == dsp::noise_reduction::amnr::NR_BYPASS_UNRELIABLE)
+                                      ? ImVec4(1, 0.6f, 0, 1)
+                                      : ImVec4(0.7f, 0.7f, 0.7f, 1));
+                ImGui::SameLine();
+                ImGui::TextColored(nrcol, "%s",
+                    dsp::noise_reduction::amnr::nrStateName(nrst));
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Mild statistical hiss reduction, capped at\n"
+                                  "9 dB so speech is never over-processed.\n"
+                                  "Adds about %.0f ms of latency and bypasses\n"
+                                  "itself when the channel offers no quiet time.",
+                                  (_this->audioNr.latencySamples() / _this->audioSampleRate) * 1000.0);
+            }
         }
 
         // Demodulator specific menu
@@ -541,6 +567,7 @@ private:
         ctcssToneId = ctcssTones.valueId(dsp::noise_reduction::CTCSS_TONE_67Hz);
         highPass = false;
         amVoiceBandpass = true;
+        amNoiseReduction = false;
 
         postProcEnabled = selectedDemod->getPostProcEnabled();
         FMIFNRAllowed = selectedDemod->getFMIFNRAllowed();
@@ -599,6 +626,9 @@ private:
         }
         if (config.conf[name][selectedDemod->getName()].contains("amVoiceBandpass")) {
             amVoiceBandpass = config.conf[name][selectedDemod->getName()]["amVoiceBandpass"];
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("amNoiseReduction")) {
+            amNoiseReduction = config.conf[name][selectedDemod->getName()]["amNoiseReduction"];
         }
         if (config.conf[name][selectedDemod->getName()].contains("deempMode")) {
             if (!config.conf[name][selectedDemod->getName()]["deempMode"].is_string()) {
@@ -671,8 +701,10 @@ private:
             afChain.enableBlock(&resamp, [=](dsp::stream<dsp::stereo_t>* out){ stream.setInput(out); });
             setAudioSampleRate(audioSampleRate);
 
-            // Configure the AM voice bandpass, then the high pass whose
-            // effective state accounts for the interlock between the two.
+            // Configure the AM audio chain: voice bandpass, then optional
+            // noise reduction, then the high pass whose effective state
+            // accounts for the interlock between the two.
+            setAmNoiseReduction(amNoiseReduction);
             setVoiceBandpass(amVoiceBandpass);
 
             // Configure the HPF
@@ -698,9 +730,10 @@ private:
         vfo->setBandwidth(bandwidth);
         selectedDemod->setBandwidth(bandwidth);
 
-        // A bandwidth change alters the noise power reaching the block, so the
+        // A bandwidth change alters the noise power reaching the blocks, so the
         // stored floor is stale by exactly 10*log10(newBw/oldBw).
         adaptiveSquelch.reset();
+        audioNr.reset();
 
         config.acquire();
         config.conf[name][selectedDemod->getName()]["bandwidth"] = bandwidth;
@@ -731,8 +764,9 @@ private:
         hpTaps = dsp::taps::highPass(300.0, 100.0, audioSampleRate);
         hpf.setTaps(hpTaps);
 
-        // Configure the AM voice bandpass sample rate
+        // Configure the AM audio chain sample rates
         voiceBandpass.setSamplerate(audioSampleRate);
+        audioNr.setSamplerate(audioSampleRate);
 
         // Configure deemphasis sample rate
         deemp.setSamplerate(audioSampleRate);
@@ -773,6 +807,27 @@ private:
         // Save config
         config.acquire();
         config.conf[name][selectedDemod->getName()]["amVoiceBandpass"] = amVoiceBandpass;
+        config.release(true);
+    }
+
+    void setAmNoiseReduction(bool enabled) {
+        // Update the state
+        amNoiseReduction = enabled;
+
+        // Check if post-processing is enabled and that a demodulator is selected
+        if (!selectedDemod || !postProcEnabled) { return; }
+
+        bool active = (selectedDemodID == RADIO_DEMOD_AM) && amNoiseReduction;
+        afChain.setBlockEnabled(&audioNr, active, [=](dsp::stream<dsp::stereo_t>* out){ stream.setInput(out); });
+        if (active) {
+            // Fresh start every time it is engaged: a noise estimate from a
+            // previous session is worse than none.
+            audioNr.reset();
+        }
+
+        // Save config
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["amNoiseReduction"] = amNoiseReduction;
         config.release(true);
     }
 
@@ -1080,6 +1135,7 @@ private:
     dsp::tap<float> hpTaps;
     dsp::filter::FIR<dsp::stereo_t, float> hpf;
     dsp::audio::VoiceBandpass voiceBandpass;
+    dsp::noise_reduction::AmNR audioNr;
     dsp::filter::Deemphasis<dsp::stereo_t> deemp;
 
     SinkManager::Stream stream;
@@ -1124,6 +1180,7 @@ private:
     bool highPass = false;
     bool highPassAllowed = false;
     bool amVoiceBandpass = true;
+    bool amNoiseReduction = false;
 
     int deempId = 0;
     bool deempAllowed;
