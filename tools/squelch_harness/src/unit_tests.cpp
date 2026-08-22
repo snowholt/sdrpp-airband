@@ -591,6 +591,226 @@ TEST(diagnostics_reader_never_observes_a_torn_snapshot) {
     CHECK_EQ(torn.load(), 0);
 }
 
+#include <dsp/noise_reduction/adaptive_squelch.h>
+#include <dsp/noise_reduction/power_squelch.h>
+
+using dsp::noise_reduction::AdaptiveSquelch;
+using dsp::noise_reduction::adaptive::ESTIMATOR_PERCENTILE;
+using dsp::noise_reduction::adaptive::ESTIMATOR_MCRA;
+using dsp::noise_reduction::adaptive::ESTIMATOR_GATED_EMA;
+
+// Runs a whole scene through the block in one call and returns the output.
+static std::vector<dsp::complex_t> runScene(AdaptiveSquelch& sq, const sg::Scene& scene) {
+    std::vector<dsp::complex_t> out(scene.iq.size());
+    int n = sq.process((int)scene.iq.size(), scene.iq.data(), out.data());
+    out.resize((size_t)n);
+    return out;
+}
+
+TEST(block_mutes_a_noise_only_scene) {
+    sg::SceneConfig cfg;
+    cfg.durationSeconds = 20.0;
+    cfg.cnrDb = -100.0f;               // effectively no transmission at all
+    sg::Scene scene = sg::generate(cfg);
+
+    AdaptiveSquelch sq;
+    sq.init(NULL, cfg.samplerate);
+    sq.setEstimator(ESTIMATOR_PERCENTILE);
+    std::vector<dsp::complex_t> out = runScene(sq, scene);
+
+    // Ignore the first 12 s while the 10 s window fills.
+    const long skip = (long)(12.0 * cfg.samplerate);
+    double energy = 0.0;
+    for (size_t i = (size_t)skip; i < out.size(); i++) {
+        energy += (double)out[i].re * out[i].re + (double)out[i].im * out[i].im;
+    }
+    CHECK_NEAR(energy, 0.0, 1e-9);
+}
+
+TEST(block_passes_a_strong_transmission) {
+    sg::SceneConfig cfg;
+    cfg.durationSeconds = 40.0;
+    cfg.cnrDb = 25.0f;
+    sg::Scene scene = sg::generate(cfg);
+
+    AdaptiveSquelch sq;
+    sq.init(NULL, cfg.samplerate);
+    sq.setEstimator(ESTIMATOR_PERCENTILE);
+    std::vector<dsp::complex_t> out = runScene(sq, scene);
+
+    // Take a label well after the window has filled and check that most of its
+    // energy survived. Output index j holds input sample j: the block emits the
+    // pre-rolled sample, so no realignment is needed.
+    const sg::Label& lbl = scene.labels.back();
+    double inE = 0.0, outE = 0.0;
+    for (long i = lbl.start; i < lbl.end; i++) {
+        inE += (double)scene.iq[(size_t)i].re * scene.iq[(size_t)i].re
+             + (double)scene.iq[(size_t)i].im * scene.iq[(size_t)i].im;
+        if (i < (long)out.size()) {
+            outE += (double)out[(size_t)i].re * out[(size_t)i].re
+                  + (double)out[(size_t)i].im * out[(size_t)i].im;
+        }
+    }
+    CHECK(outE > 0.7 * inE);
+}
+
+TEST(block_output_is_independent_of_chunking) {
+    // The acceptance criterion for the variable-count constraint, at block level.
+    sg::SceneConfig cfg;
+    cfg.durationSeconds = 25.0;
+    cfg.cnrDb = 15.0f;
+    sg::Scene scene = sg::generate(cfg);
+
+    AdaptiveSquelch a;
+    a.init(NULL, cfg.samplerate);
+    std::vector<dsp::complex_t> whole(scene.iq.size());
+    int nWhole = a.process((int)scene.iq.size(), scene.iq.data(), whole.data());
+    whole.resize((size_t)nWhole);
+
+    AdaptiveSquelch b;
+    b.init(NULL, cfg.samplerate);
+    std::vector<dsp::complex_t> chunked;
+    std::vector<dsp::complex_t> scratch(65536);
+    sg::Rng chunkRng(1234);
+    int pos = 0;
+    while (pos < (int)scene.iq.size()) {
+        int take = 1 + (int)(chunkRng.uniform() * 8192.0f);
+        if (pos + take > (int)scene.iq.size()) { take = (int)scene.iq.size() - pos; }
+        int n = b.process(take, scene.iq.data() + pos, scratch.data());
+        chunked.insert(chunked.end(), scratch.begin(), scratch.begin() + n);
+        pos += take;
+    }
+
+    CHECK_EQ(whole.size(), chunked.size());
+    bool identical = whole.size() == chunked.size();
+    for (size_t i = 0; identical && i < whole.size(); i++) {
+        if (whole[i].re != chunked[i].re || whole[i].im != chunked[i].im) { identical = false; }
+    }
+    CHECK(identical);
+}
+
+TEST(block_timing_scales_across_samplerates) {
+    // The same scene in wall-clock seconds at three samplerates must produce
+    // gate transitions at the same times, not at the same sample indices.
+    const double rates[] = { 15000.0, 24000.0, 50000.0 };
+    double openTimes[3] = { 0.0, 0.0, 0.0 };
+
+    for (int r = 0; r < 3; r++) {
+        sg::SceneConfig cfg;
+        cfg.samplerate = rates[r];
+        cfg.durationSeconds = 30.0;
+        cfg.cnrDb = 20.0f;
+        sg::Scene scene = sg::generate(cfg);
+
+        AdaptiveSquelch sq;
+        sq.init(NULL, cfg.samplerate);
+        std::vector<dsp::complex_t> out(scene.iq.size());
+
+        // Feed in 10 ms slices and record when the gate first opens after 15 s.
+        const int slice = (int)std::lround(0.010 * cfg.samplerate);
+        for (int pos = 0; pos + slice <= (int)scene.iq.size(); pos += slice) {
+            sq.process(slice, scene.iq.data() + pos, out.data());
+            double t = (double)pos / cfg.samplerate;
+            if (t > 15.0 && openTimes[r] == 0.0 && sq.diagnostics().state != 0) {
+                openTimes[r] = t;
+            }
+        }
+        CHECK(openTimes[r] > 15.0);
+    }
+    CHECK_NEAR(openTimes[0], openTimes[1], 0.15);
+    CHECK_NEAR(openTimes[1], openTimes[2], 0.15);
+}
+
+TEST(block_all_three_estimators_run) {
+    const dsp::noise_reduction::adaptive::EstimatorType types[] = {
+        ESTIMATOR_PERCENTILE, ESTIMATOR_MCRA, ESTIMATOR_GATED_EMA
+    };
+    sg::SceneConfig cfg;
+    cfg.durationSeconds = 25.0;
+    sg::Scene scene = sg::generate(cfg);
+
+    for (auto t : types) {
+        AdaptiveSquelch sq;
+        sq.init(NULL, cfg.samplerate);
+        sq.setEstimator(t);
+        std::vector<dsp::complex_t> out = runScene(sq, scene);
+        CHECK(out.size() > 0);
+        dsp::noise_reduction::adaptive::Diagnostics d = sq.diagnostics();
+        CHECK(d.noiseFloorDb > -140.0f);
+        CHECK(d.noiseFloorDb < 0.0f);
+    }
+}
+
+TEST(block_invalidation_paths_clear_state) {
+    sg::SceneConfig cfg;
+    cfg.durationSeconds = 25.0;
+    cfg.cnrDb = 25.0f;
+    sg::Scene scene = sg::generate(cfg);
+
+    AdaptiveSquelch sq;
+    sq.init(NULL, cfg.samplerate);
+    runScene(sq, scene);
+    CHECK(sq.diagnostics().noiseFloorDb > -140.0f);
+
+    sq.reset();
+    CHECK_EQ(sq.diagnostics().state, 0);
+
+    // A samplerate change must also invalidate, not just resize.
+    runScene(sq, scene);
+    sq.setSamplerate(48000.0);
+    CHECK_EQ(sq.diagnostics().state, 0);
+}
+
+TEST(block_switching_artifact_is_smaller_than_power_squelch) {
+    // Acceptance criterion 6: the ramp must measurably beat the abrupt switch.
+    // Measured as the largest single-sample jump in output magnitude.
+    sg::SceneConfig cfg;
+    cfg.durationSeconds = 40.0;
+    cfg.cnrDb = 25.0f;
+    sg::Scene scene = sg::generate(cfg);
+
+    AdaptiveSquelch sq;
+    sq.init(NULL, cfg.samplerate);
+    std::vector<dsp::complex_t> adaptive = runScene(sq, scene);
+
+    // power_squelch.h thresholds on 10*log10(mean|x|) over one process() block,
+    // not on mean power, so both its level and its block size have to be
+    // realistic or it never switches at all and the comparison is vacuous.
+    auto meanMagDb = [&](long a, long b) {
+        double sum = 0.0;
+        for (long i = a; i < b; i++) {
+            sum += std::sqrt((double)scene.iq[(size_t)i].re * scene.iq[(size_t)i].re
+                           + (double)scene.iq[(size_t)i].im * scene.iq[(size_t)i].im);
+        }
+        return 10.0 * std::log10(sum / (double)(b - a));
+    };
+    const double idleDb = meanMagDb(0, scene.labels[0].start);
+    const double activeDb = meanMagDb(scene.labels[0].start, scene.labels[0].end);
+
+    dsp::noise_reduction::PowerSquelch ps;
+    ps.init(NULL, 0.5 * (idleDb + activeDb));
+    std::vector<dsp::complex_t> naive(scene.iq.size());
+    const int blockLen = (int)std::lround(0.010 * cfg.samplerate);
+    long pos = 0;
+    while (pos + blockLen <= (long)scene.iq.size()) {
+        ps.process(blockLen, scene.iq.data() + pos, naive.data() + pos);
+        pos += blockLen;
+    }
+    naive.resize((size_t)pos);
+
+    auto maxJump = [](const std::vector<dsp::complex_t>& v) {
+        double worst = 0.0;
+        for (size_t i = 1; i < v.size(); i++) {
+            double a = std::sqrt((double)v[i - 1].re * v[i - 1].re + (double)v[i - 1].im * v[i - 1].im);
+            double b = std::sqrt((double)v[i].re * v[i].re + (double)v[i].im * v[i].im);
+            double d = std::fabs(b - a);
+            if (d > worst) { worst = d; }
+        }
+        return worst;
+    };
+    CHECK(maxJump(adaptive) < maxJump(naive));
+}
+
 int main() {
     return tf::runAll();
 }
