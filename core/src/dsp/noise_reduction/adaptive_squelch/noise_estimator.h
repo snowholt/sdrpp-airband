@@ -254,4 +254,90 @@ namespace dsp::noise_reduction::adaptive {
         bool _started = false;
         float _s = 0.0f, _min = 0.0f, _runMin = 0.0f, _p = 0.0f, _noise = 0.0f;
     };
+
+    // ---------------------------------------------------------------------
+    // E - gate-conditioned EMA with a slow shadow tracker and a watchdog.
+    //
+    // RETAINED AS A MEASURED BASELINE. NOT SUITABLE AS A DEFAULT.
+    //
+    // Two structural failures, both documented in the literature and both
+    // observed in shipped software:
+    //
+    //   Staleness  - while the gate is open the fast tracker receives no
+    //                observations at all. A long transmission, or a
+    //                continuously transmitting channel such as ATIS or AWOS,
+    //                starves it indefinitely. RTLSDR-Airband documents exactly
+    //                this failure for its automatic squelch.
+    //   Self-lock  - a false open freezes the very estimate that caused it, so
+    //                the error can never be corrected by new observations.
+    //
+    // The shadow tracker and the watchdog bound both failures. They do not
+    // remove them. Use PercentileEstimator or McraEstimator by default.
+    // ---------------------------------------------------------------------
+    class GatedEmaEstimator : public NoiseEstimator {
+    public:
+        static constexpr double FAST_TAU_SECONDS = 0.75;
+        static constexpr double SHADOW_TAU_SECONDS = 20.0;
+        static constexpr double WATCHDOG_SECONDS = 30.0;
+
+        void init(double frameSeconds) override {
+            _frameSeconds = frameSeconds;
+            _aFast = alphaFor(FAST_TAU_SECONDS, frameSeconds);
+            _aShadow = alphaFor(SHADOW_TAU_SECONDS, frameSeconds);
+            _watchdogFrames = (int)std::lround(WATCHDOG_SECONDS / frameSeconds);
+            if (_watchdogFrames < 1) { _watchdogFrames = 1; }
+            reset();
+        }
+
+        void reset() override {
+            _started = false;
+            _fast = 0.0f;
+            _shadow = 0.0f;
+            _openFrames = 0;
+        }
+
+        float update(float framePowerDb, bool gateOpen) override {
+            if (!_started) {
+                _started = true;
+                _fast = _shadow = framePowerDb;
+                _openFrames = 0;
+                return _fast;
+            }
+
+            // The shadow never freezes, whatever the gate is doing. It follows
+            // downward at the fast rate and upward only slowly, so an open gate
+            // cannot drag it up quickly but a genuinely quieter band still
+            // reaches it in well under a second.
+            if (framePowerDb < _shadow) {
+                _shadow = _aFast * _shadow + (1.0f - _aFast) * framePowerDb;
+            }
+            else {
+                _shadow = _aShadow * _shadow + (1.0f - _aShadow) * framePowerDb;
+            }
+
+            if (!gateOpen) {
+                _fast = _aFast * _fast + (1.0f - _aFast) * framePowerDb;
+                _openFrames = 0;
+            }
+            else {
+                _openFrames++;
+                if (_openFrames > _watchdogFrames) {
+                    // The gate has been open too long for the frozen value to be
+                    // trusted. Hand control to the shadow rather than keep it.
+                    _fast = _shadow;
+                }
+            }
+            return _fast;
+        }
+
+        const char* name() const override { return "gated_ema"; }
+
+    private:
+        double _frameSeconds = 0.010;
+        float _aFast = 0.0f, _aShadow = 0.0f;
+        int _watchdogFrames = 3000;
+        int _openFrames = 0;
+        bool _started = false;
+        float _fast = 0.0f, _shadow = 0.0f;
+    };
 }

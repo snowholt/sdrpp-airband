@@ -285,6 +285,57 @@ TEST(mcra_reset_clears_state) {
     CHECK_NEAR(e.update(-40.0f, false), -40.0, 0.001);
 }
 
+using dsp::noise_reduction::adaptive::GatedEmaEstimator;
+
+TEST(gated_ema_converges_while_the_gate_is_closed) {
+    GatedEmaEstimator e;
+    e.init(0.010);
+    float n = 0.0f;
+    for (int i = 0; i < 1000; i++) { n = e.update(-75.0f, false); }
+    CHECK_NEAR(n, -75.0, 0.5);
+}
+
+TEST(gated_ema_goes_stale_while_the_gate_is_open) {
+    // This is the documented staleness failure, asserted deliberately so the
+    // behaviour is recorded rather than discovered later. The watchdog has not
+    // fired yet at this point.
+    GatedEmaEstimator e;
+    e.init(0.010);
+    for (int i = 0; i < 1000; i++) { e.update(-90.0f, false); }
+    float frozen = 0.0f;
+    for (int i = 0; i < 500; i++) { frozen = e.update(-50.0f, true); }
+    CHECK_NEAR(frozen, -90.0, 0.5);
+}
+
+TEST(gated_ema_watchdog_recovers_from_a_long_open_gate) {
+    // After WATCHDOG_SECONDS of continuous open the fast tracker is no longer
+    // trustworthy and control passes to the shadow, which never freezes.
+    GatedEmaEstimator e;
+    e.init(0.010);
+    for (int i = 0; i < 1000; i++) { e.update(-90.0f, false); }
+    float n = 0.0f;
+    const int frames = (int)(GatedEmaEstimator::WATCHDOG_SECONDS / 0.010) + 12000;
+    for (int i = 0; i < frames; i++) { n = e.update(-50.0f, true); }
+    CHECK(n > -85.0f);
+}
+
+TEST(gated_ema_follows_a_downward_step_while_closed) {
+    GatedEmaEstimator e;
+    e.init(0.010);
+    for (int i = 0; i < 5000; i++) { e.update(-40.0f, false); }
+    float n = 0.0f;
+    for (int i = 0; i < 500; i++) { n = e.update(-95.0f, false); }
+    CHECK(n < -85.0f);
+}
+
+TEST(gated_ema_reset_clears_state) {
+    GatedEmaEstimator e;
+    e.init(0.010);
+    for (int i = 0; i < 2000; i++) { e.update(-100.0f, false); }
+    e.reset();
+    CHECK_NEAR(e.update(-30.0f, false), -30.0, 0.001);
+}
+
 int main() {
     return tf::runAll();
 }
