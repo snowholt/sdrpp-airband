@@ -1057,6 +1057,70 @@ TEST(audio_word_labels_nest_inside_transmissions) {
     }
 }
 
+#include "audio_metrics.h"
+
+TEST(metrics_scores_a_known_noise_reduction_exactly) {
+    // Out is exactly half the amplitude of In everywhere outside labels:
+    // a -6.02 dB reduction in the noise-only regions.
+    const long n = 48000;
+    std::vector<float> in((size_t)n), out((size_t)n);
+    sg::Rng rng(13);
+    for (long i = 0; i < n; i++) {
+        in[(size_t)i] = rng.gaussian() * 0.05f;
+        out[(size_t)i] = 0.5f * in[(size_t)i];
+    }
+    std::vector<sg::Label> labels{ { 16000, 32000 } };   // one "transmission"
+
+    double db = metrics::noiseReductionDb(in, out, labels, 48000.0, 0.05);
+    CHECK_NEAR(db, -6.0206, 0.25);
+}
+
+TEST(metrics_fidelity_compensates_reported_delay) {
+    const long n = 48000;
+    const int delay = 456;
+    std::vector<float> clean((size_t)n, 0.0f);
+    sg::Rng rng(17);
+    // Speech-ish energy inside the transmission only.
+    for (long i = 16000; i < 32000; i++) { clean[(size_t)i] = rng.gaussian() * 0.1f; }
+    std::vector<float> out((size_t)n, 0.0f);
+    for (long i = 0; i + delay < n; i++) { out[(size_t)(i + delay)] = 0.891f * clean[(size_t)i]; }
+
+    std::vector<sg::Label> labels{ { 16000, 32000 } };
+    double db = metrics::inBandFidelityDb(clean, out, labels, delay);
+    CHECK_NEAR(db, -1.0, 0.15);
+}
+
+TEST(metrics_jump_metric_catches_a_planted_click) {
+    const long n = 48000;
+    std::vector<float> v((size_t)n);
+    for (long i = 0; i < n; i++) { v[(size_t)i] = 0.01f * std::sin(0.01 * i); }
+    float base = metrics::maxSampleJump(v);
+    CHECK(base < 0.001f);
+
+    v[24000] += 0.5f;
+    float planted = metrics::maxSampleJump(v);
+    CHECK(planted > 0.4f);
+}
+
+TEST(export_triplet_round_trips_through_wav_io) {
+    const double rate = 48000.0;
+    std::vector<float> v(480, 0.125f);
+    ag::AudioScene dummy;
+    dummy.rate = rate;
+
+    bool ok = metrics::exportWavTriplet("/tmp/squelch_tri", rate, v, v, v);
+    CHECK(ok);
+
+    ag::WavData r = ag::read("/tmp/squelch_tri_ref.wav");
+    ag::WavData d = ag::read("/tmp/squelch_tri_deg.wav");
+    ag::WavData p = ag::read("/tmp/squelch_tri_proc.wav");
+    CHECK(r.ok && d.ok && p.ok);
+    CHECK_EQ((int)r.samples.size(), 480);
+    std::remove("/tmp/squelch_tri_ref.wav");
+    std::remove("/tmp/squelch_tri_deg.wav");
+    std::remove("/tmp/squelch_tri_proc.wav");
+}
+
 int main() {
     return tf::runAll();
 }
