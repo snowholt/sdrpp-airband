@@ -1,4 +1,7 @@
 build/
+build-harness/
+build-default/
+build-app/
 .vscode/
 .vs/
 .idea/
