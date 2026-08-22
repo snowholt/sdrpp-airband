@@ -13,6 +13,7 @@
 #include <dsp/noise_reduction/ctcss_squelch.h>
 #include <dsp/multirate/rational_resampler.h>
 #include <dsp/filter/deephasis.h>
+#include <dsp/audio/voice_bandpass.h>
 #include <core.h>
 #include <stdint.h>
 #include <utils/optionlist.h>
@@ -109,11 +110,13 @@ public:
         resamp.init(NULL, 250000.0, 48000.0);
         hpTaps = dsp::taps::highPass(300.0, 100.0, 48000.0);
         hpf.init(NULL, hpTaps);
+        voiceBandpass.init(NULL, audioSampleRate);
         deemp.init(NULL, 50e-6, 48000.0);
 
         afChain.addBlock(&ctcss, false);
         afChain.addBlock(&resamp, true);
         afChain.addBlock(&hpf, false);
+        afChain.addBlock(&voiceBandpass, false);
         afChain.addBlock(&deemp, false);
 
         // Initialize the sink
@@ -354,8 +357,27 @@ private:
 
         // High pass
         if (_this->highPassAllowed) {
+            bool vbpSupersedes = (_this->selectedDemodID == RADIO_DEMOD_AM) && _this->amVoiceBandpass;
+            if (vbpSupersedes && _this->enabled) { style::beginDisabled(); }
             if (ImGui::Checkbox(("High Pass##_radio_hpf_" + _this->name).c_str(), &_this->highPass)) {
                 _this->setHighPass(_this->highPass);
+            }
+            if (vbpSupersedes && ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Superseded by the voice bandpass while it\n"
+                                  "is active on AM. Your setting is kept.");
+            }
+            if (vbpSupersedes && _this->enabled) { style::endDisabled(); }
+        }
+
+        // AM voice bandpass
+        if (_this->selectedDemodID == RADIO_DEMOD_AM && _this->postProcEnabled) {
+            if (ImGui::Checkbox(("Voice Bandpass##_radio_vbp_" + _this->name).c_str(), &_this->amVoiceBandpass)) {
+                _this->setVoiceBandpass(_this->amVoiceBandpass);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("300-2700 Hz voice shaping for airband.\n"
+                                  "Adds about %.0f ms of latency.",
+                                  (_this->voiceBandpass.delaySamples() / _this->audioSampleRate) * 1000.0);
             }
         }
 
@@ -518,6 +540,7 @@ private:
         squelchEstimatorId = squelchEstimators.keyId("percentile");
         ctcssToneId = ctcssTones.valueId(dsp::noise_reduction::CTCSS_TONE_67Hz);
         highPass = false;
+        amVoiceBandpass = true;
 
         postProcEnabled = selectedDemod->getPostProcEnabled();
         FMIFNRAllowed = selectedDemod->getFMIFNRAllowed();
@@ -573,6 +596,9 @@ private:
         }
         if (config.conf[name][selectedDemod->getName()].contains("highPass")) {
             highPass = config.conf[name][selectedDemod->getName()]["highPass"];
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("amVoiceBandpass")) {
+            amVoiceBandpass = config.conf[name][selectedDemod->getName()]["amVoiceBandpass"];
         }
         if (config.conf[name][selectedDemod->getName()].contains("deempMode")) {
             if (!config.conf[name][selectedDemod->getName()]["deempMode"].is_string()) {
@@ -645,6 +671,10 @@ private:
             afChain.enableBlock(&resamp, [=](dsp::stream<dsp::stereo_t>* out){ stream.setInput(out); });
             setAudioSampleRate(audioSampleRate);
 
+            // Configure the AM voice bandpass, then the high pass whose
+            // effective state accounts for the interlock between the two.
+            setVoiceBandpass(amVoiceBandpass);
+
             // Configure the HPF
             setHighPass(highPass && highPassAllowed);
 
@@ -701,6 +731,9 @@ private:
         hpTaps = dsp::taps::highPass(300.0, 100.0, audioSampleRate);
         hpf.setTaps(hpTaps);
 
+        // Configure the AM voice bandpass sample rate
+        voiceBandpass.setSamplerate(audioSampleRate);
+
         // Configure deemphasis sample rate
         deemp.setSamplerate(audioSampleRate);
 
@@ -714,13 +747,43 @@ private:
         // Check if post-processing is enabled and that a demodulator is selected
         if (!postProcEnabled || !selectedDemod) { return; }
 
-        // Set the state of the HPF in the AF chain
-        afChain.setBlockEnabled(&hpf, enabled, [=](dsp::stream<dsp::stereo_t>* out){ stream.setInput(out); });
+        applyHighPassState();
 
         // Save config
         config.acquire();
         config.conf[name][selectedDemod->getName()]["highPass"] = enabled;
         config.release(true);
+    }
+
+    void setVoiceBandpass(bool enabled) {
+        // Update the state
+        amVoiceBandpass = enabled;
+
+        // Check if post-processing is enabled and that a demodulator is selected
+        if (!selectedDemod || !postProcEnabled) { return; }
+
+        // Set the state of the bandpass in the AF chain
+        bool active = (selectedDemodID == RADIO_DEMOD_AM) && amVoiceBandpass;
+        afChain.setBlockEnabled(&voiceBandpass, active, [=](dsp::stream<dsp::stereo_t>* out){ stream.setInput(out); });
+
+        // The bandpass supersedes the high pass while active, so the
+        // effective high-pass state changes with it
+        applyHighPassState();
+
+        // Save config
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["amVoiceBandpass"] = amVoiceBandpass;
+        config.release(true);
+    }
+
+    // Effective high-pass state. On AM the voice bandpass already contains a
+    // 300 Hz lower cutoff, so while it is active the generic high pass stays
+    // out of the chain even though its stored preference is preserved and
+    // takes effect again as soon as the bandpass is switched off.
+    void applyHighPassState() {
+        bool vbpActive = (selectedDemodID == RADIO_DEMOD_AM) && amVoiceBandpass;
+        afChain.setBlockEnabled(&hpf, highPass && highPassAllowed && !vbpActive,
+                                [=](dsp::stream<dsp::stereo_t>* out){ stream.setInput(out); });
     }
 
     void setDeemphasisMode(DeemphasisMode mode) {
@@ -1016,6 +1079,7 @@ private:
     dsp::multirate::RationalResampler<dsp::stereo_t> resamp;
     dsp::tap<float> hpTaps;
     dsp::filter::FIR<dsp::stereo_t, float> hpf;
+    dsp::audio::VoiceBandpass voiceBandpass;
     dsp::filter::Deemphasis<dsp::stereo_t> deemp;
 
     SinkManager::Stream stream;
@@ -1059,6 +1123,7 @@ private:
 
     bool highPass = false;
     bool highPassAllowed = false;
+    bool amVoiceBandpass = true;
 
     int deempId = 0;
     bool deempAllowed;
