@@ -336,6 +336,58 @@ TEST(gated_ema_reset_clears_state) {
     CHECK_NEAR(e.update(-30.0f, false), -30.0, 0.001);
 }
 
+#include <dsp/noise_reduction/adaptive_squelch/preroll.h>
+
+using dsp::noise_reduction::adaptive::PreRoll;
+
+TEST(preroll_length_follows_samplerate) {
+    PreRoll p;
+    p.init(48000.0, 0.040);
+    CHECK_EQ(p.delaySamples(), 1920);
+    p.setLength(15000.0, 0.040);
+    CHECK_EQ(p.delaySamples(), 600);
+}
+
+TEST(preroll_delays_by_exactly_the_requested_samples) {
+    PreRoll p;
+    p.init(1000.0, 0.005);        // 5 samples
+    CHECK_EQ(p.delaySamples(), 5);
+
+    dsp::complex_t out;
+    // The first 5 pushes prime the line and produce nothing usable.
+    for (int i = 0; i < 5; i++) {
+        CHECK(!p.push(dsp::complex_t{ (float)i, 0.0f }, out));
+    }
+    // From here every push returns the sample from 5 pushes ago.
+    for (int i = 5; i < 50; i++) {
+        CHECK(p.push(dsp::complex_t{ (float)i, 0.0f }, out));
+        CHECK_NEAR(out.re, (double)(i - 5), 1e-6);
+    }
+}
+
+TEST(preroll_zero_length_is_a_passthrough) {
+    PreRoll p;
+    p.init(48000.0, 0.0);
+    CHECK_EQ(p.delaySamples(), 0);
+    dsp::complex_t out;
+    CHECK(p.push(dsp::complex_t{ 3.0f, 4.0f }, out));
+    CHECK_NEAR(out.re, 3.0, 1e-6);
+    CHECK_NEAR(out.im, 4.0, 1e-6);
+}
+
+TEST(preroll_reset_re_primes) {
+    PreRoll p;
+    p.init(1000.0, 0.005);
+    dsp::complex_t out;
+    for (int i = 0; i < 20; i++) { p.push(dsp::complex_t{ (float)i, 0.0f }, out); }
+    p.reset();
+    for (int i = 0; i < 5; i++) {
+        CHECK(!p.push(dsp::complex_t{ 99.0f, 0.0f }, out));
+    }
+    CHECK(p.push(dsp::complex_t{ 99.0f, 0.0f }, out));
+    CHECK_NEAR(out.re, 99.0, 1e-6);
+}
+
 int main() {
     return tf::runAll();
 }
