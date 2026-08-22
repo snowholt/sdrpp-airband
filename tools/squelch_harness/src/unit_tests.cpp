@@ -388,6 +388,153 @@ TEST(preroll_reset_re_primes) {
     CHECK_NEAR(out.re, 99.0, 1e-6);
 }
 
+#include <dsp/noise_reduction/adaptive_squelch/gate.h>
+
+using dsp::noise_reduction::adaptive::Gate;
+using dsp::noise_reduction::adaptive::GATE_CLOSED;
+using dsp::noise_reduction::adaptive::GATE_QUALIFY;
+using dsp::noise_reduction::adaptive::GATE_OPEN;
+using dsp::noise_reduction::adaptive::GATE_HANG;
+
+// Advances the gate by n frames at a fixed SNR, running the per-sample ramp
+// for a whole frame each time so gain and state stay in step.
+static void runFrames(Gate& g, float snrDb, int frames, int samplesPerFrame) {
+    for (int f = 0; f < frames; f++) {
+        g.updateFrame(snrDb);
+        for (int s = 0; s < samplesPerFrame; s++) { g.nextGain(); }
+    }
+}
+
+TEST(gate_starts_closed_and_silent) {
+    Gate g;
+    g.init(15000.0, 0.010);
+    CHECK(g.state() == GATE_CLOSED);
+    CHECK(!g.isOpen());
+    CHECK_NEAR(g.nextGain(), 0.0, 1e-6);
+}
+
+TEST(gate_requires_the_qualify_period_before_opening) {
+    Gate g;
+    g.init(15000.0, 0.010);
+    g.setMargins(9.5f, 6.5f);
+    g.setQualify(0.030);            // 3 frames
+
+    g.updateFrame(12.0f);
+    CHECK(g.state() == GATE_QUALIFY);
+    g.updateFrame(12.0f);
+    CHECK(g.state() == GATE_QUALIFY);
+    g.updateFrame(12.0f);
+    CHECK(g.state() == GATE_OPEN);
+}
+
+TEST(gate_rejects_a_single_frame_impulse) {
+    Gate g;
+    g.init(15000.0, 0.010);
+    g.setMargins(9.5f, 6.5f);
+    g.setQualify(0.030);
+
+    g.updateFrame(30.0f);           // one loud frame
+    CHECK(g.state() == GATE_QUALIFY);
+    g.updateFrame(0.0f);            // and it is gone
+    CHECK(g.state() == GATE_CLOSED);
+    CHECK(!g.isOpen());
+}
+
+TEST(gate_hysteresis_holds_open_between_the_two_thresholds) {
+    Gate g;
+    g.init(15000.0, 0.010);
+    g.setMargins(9.5f, 6.5f);
+    g.setQualify(0.030);
+    runFrames(g, 12.0f, 5, 150);
+    CHECK(g.state() == GATE_OPEN);
+
+    // 8 dB is below the open threshold but above the close threshold.
+    runFrames(g, 8.0f, 50, 150);
+    CHECK(g.state() == GATE_OPEN);
+
+    runFrames(g, 5.0f, 1, 150);
+    CHECK(g.state() == GATE_HANG);
+}
+
+TEST(gate_hang_holds_then_closes) {
+    Gate g;
+    g.init(15000.0, 0.010);
+    g.setMargins(9.5f, 6.5f);
+    g.setQualify(0.030);
+    g.setHang(0.200);
+    g.setRelease(0.150);
+    runFrames(g, 12.0f, 5, 150);
+    CHECK(g.state() == GATE_OPEN);
+
+    runFrames(g, 0.0f, 20, 150);    // 200 ms: still holding
+    CHECK(g.isOpen());
+    runFrames(g, 0.0f, 20, 150);    // 350 ms total: closed
+    CHECK(g.state() == GATE_CLOSED);
+    CHECK(!g.isOpen());
+}
+
+TEST(gate_hang_reopens_without_re_qualifying) {
+    Gate g;
+    g.init(15000.0, 0.010);
+    g.setMargins(9.5f, 6.5f);
+    g.setQualify(0.030);
+    g.setHang(0.200);
+    runFrames(g, 12.0f, 5, 150);
+    runFrames(g, 0.0f, 5, 150);
+    CHECK(g.state() == GATE_HANG);
+    g.updateFrame(12.0f);
+    CHECK(g.state() == GATE_OPEN);
+}
+
+TEST(gate_ramp_is_monotonic_and_reaches_both_endpoints) {
+    Gate g;
+    g.init(1000.0, 0.010);          // 10 samples per frame
+    g.setMargins(9.5f, 6.5f);
+    g.setQualify(0.010);            // 1 frame
+    g.setRamp(0.020);               // 20 samples
+
+    g.updateFrame(12.0f);
+    CHECK(g.state() == GATE_OPEN);
+
+    float prev = -1.0f;
+    bool monotonic = true;
+    for (int i = 0; i < 20; i++) {
+        float gain = g.nextGain();
+        if (gain < prev - 1e-6f) { monotonic = false; }
+        prev = gain;
+    }
+    CHECK(monotonic);
+    CHECK_NEAR(prev, 1.0, 1e-4);
+    CHECK_NEAR(g.nextGain(), 1.0, 1e-6);
+}
+
+TEST(gate_ramp_has_no_discontinuity_at_the_start_of_a_transition) {
+    // A raised cosine starts with zero slope, which is the property that
+    // removes the click. The first ramp step must be far smaller than a
+    // uniform step of the same length would be.
+    Gate g;
+    g.init(1000.0, 0.010);
+    g.setMargins(9.5f, 6.5f);
+    g.setQualify(0.010);
+    g.setRamp(0.100);               // 100 samples
+    g.updateFrame(12.0f);
+
+    float first = g.nextGain();
+    CHECK(first < (1.0f / 100.0f));
+}
+
+TEST(gate_reset_returns_to_closed_and_silent) {
+    Gate g;
+    g.init(15000.0, 0.010);
+    g.setMargins(9.5f, 6.5f);
+    g.setQualify(0.010);
+    runFrames(g, 20.0f, 20, 150);
+    CHECK(g.isOpen());
+    g.reset();
+    CHECK(g.state() == GATE_CLOSED);
+    CHECK_NEAR(g.nextGain(), 0.0, 1e-6);
+}
+
 int main() {
     return tf::runAll();
 }
