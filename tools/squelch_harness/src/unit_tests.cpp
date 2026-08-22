@@ -1465,6 +1465,187 @@ TEST(stft_reset_clears_overlap_add_state) {
     }
 }
 
+#include <dsp/noise_reduction/am_nr/noise_psd.h>
+
+using dsp::noise_reduction::amnr::NoisePsdTracker;
+
+// Feeds one frame of white noise power at the given level into every bin.
+// Power fluctuations are one-sided and bounded away from zero, like a real
+// periodogram's.
+static void feedNoise(NoisePsdTracker& t, std::vector<float>& magSq,
+                      std::vector<float>& out, float level, int frames, sg::Rng& rng) {
+    for (int f = 0; f < frames; f++) {
+        for (auto& v : magSq) { v = level * (0.5f + rng.uniform()); }
+        t.process(magSq.data(), out.data());
+    }
+}
+
+TEST(psd_converges_on_stationary_noise) {
+    const int bins = 129;
+    const double hopSec = 256.0 / 48000.0;
+    NoisePsdTracker t;
+    t.init(bins, hopSec);
+
+    std::vector<float> magSq((size_t)bins), out((size_t)bins, 0.0f);
+    sg::Rng rng(51);
+    feedNoise(t, magSq, out, 1e-4f, (int)(3.0 / hopSec), rng);
+
+    for (int k = 0; k < bins; k++) {
+        CHECK_NEAR(out[(size_t)k], 1e-4f, 0.3e-4f);
+    }
+    CHECK(t.reliable());
+}
+
+TEST(psd_freezes_during_sustained_tone) {
+    const int bins = 129;
+    const double hopSec = 256.0 / 48000.0;
+    NoisePsdTracker t;
+    t.init(bins, hopSec);
+
+    std::vector<float> magSq((size_t)bins), out((size_t)bins, 0.0f);
+    sg::Rng rng(52);
+    feedNoise(t, magSq, out, 1e-4f, (int)(3.0 / hopSec), rng);
+
+    // Sustained tone in bins 50..60 at +30 dB above the floor: the estimate
+    // there must not chase the signal.
+    for (int f = 0; f < (int)(2.0 / hopSec); f++) {
+        for (auto& v : magSq) { v = 1e-4f * (1.0f + 0.5f * rng.gaussian()); }
+        for (int k = 50; k <= 60; k++) { magSq[(size_t)k] = 1e-1f; }
+        t.process(magSq.data(), out.data());
+    }
+    for (int k = 50; k <= 60; k++) {
+        CHECK(out[(size_t)k] < 3.0e-4f);
+    }
+}
+
+TEST(psd_rejects_a_single_impulse_frame) {
+    const int bins = 129;
+    const double hopSec = 256.0 / 48000.0;
+    NoisePsdTracker t;
+    t.init(bins, hopSec);
+
+    std::vector<float> magSq((size_t)bins), out((size_t)bins, 0.0f);
+    sg::Rng rng(53);
+    feedNoise(t, magSq, out, 1e-4f, (int)(3.0 / hopSec), rng);
+
+    // Steady-state sits slightly under the nominal level: presence gating
+    // freezes bins during their own noise peaks, so the estimate skews a
+    // little toward the low excursions. That bias is bounded and small.
+    for (auto& v : out) { CHECK_NEAR(v, 1e-4f, 0.2e-4f); }
+
+    // One enormous impulse frame.
+    for (auto& v : magSq) { v = 1e-1f; }
+    t.process(magSq.data(), out.data());
+
+    // Back to quiet. The estimate carries only a small transient from the
+    // impulse (upward targets are clipped, and presence gates the frames
+    // where S is still elevated); it re-settles within the fast downward
+    // time constant.
+    feedNoise(t, magSq, out, 1e-4f, 150, rng);
+    for (int k = 10; k < bins; k += 20) {
+        CHECK_NEAR(out[(size_t)k], 1e-4f, 0.3e-4f);
+    }
+}
+
+TEST(psd_reliability_lifecycle_follows_the_script) {
+    const int bins = 129;
+    const double hopSec = 256.0 / 48000.0;
+    NoisePsdTracker t;
+    t.init(bins, hopSec);
+
+    std::vector<float> magSq((size_t)bins), out((size_t)bins, 0.0f);
+    sg::Rng rng(54);
+
+    // Fresh tracker: no absence evidence yet, so unreliable.
+    CHECK(!t.reliable());
+    feedNoise(t, magSq, out, 1e-4f, (int)(2.0 / hopSec), rng);
+    CHECK(t.reliable());
+
+    // More than five seconds of continuous presence starves the estimator.
+    const int speechFrames = (int)(6.0 / hopSec);
+    for (int f = 0; f < speechFrames; f++) {
+        for (auto& v : magSq) { v = 1e-2f; }
+        t.process(magSq.data(), out.data());
+    }
+    CHECK(!t.reliable());
+
+    // A short quiet stretch restores evidence and reliability. Two clocks
+    // must run out: the smoothed periodogram falls below the presence
+    // threshold within a few tens of milliseconds, but the occupancy EMA -
+    // which spent six seconds near 1.0 - needs about half a second of quiet
+    // itself before the guard releases.
+    feedNoise(t, magSq, out, 1e-4f, 160, rng);
+    CHECK(t.reliable());
+}
+
+TEST(psd_reliability_fails_on_high_occupancy_without_one_long_gap) {
+    const int bins = 129;
+    const double hopSec = 256.0 / 48000.0;
+    NoisePsdTracker t;
+    t.init(bins, hopSec);
+
+    std::vector<float> magSq((size_t)bins), out((size_t)bins, 0.0f);
+    sg::Rng rng(55);
+    feedNoise(t, magSq, out, 1e-4f, (int)(2.0 / hopSec), rng);
+    CHECK(t.reliable());
+
+    // Busy channel: 90% presence in short bursts, never a long gap. The
+    // occupancy-style guard must trip even though no single gap exceeds the
+    // staleness timeout.
+    const int cycles = (int)(8.0 / hopSec / 10);
+    for (int c = 0; c < cycles; c++) {
+        for (int f = 0; f < 9; f++) {
+            for (auto& v : magSq) { v = 1e-2f; }
+            t.process(magSq.data(), out.data());
+        }
+        for (int f = 0; f < 1; f++) {
+            for (auto& v : magSq) { v = 1e-4f; }
+            t.process(magSq.data(), out.data());
+        }
+    }
+    CHECK(!t.reliable());
+}
+
+TEST(psd_tracks_a_floor_step_downward_faster_than_upward) {
+    const int bins = 128;   // even count exercises edge clamping
+    const double hopSec = 256.0 / 48000.0;
+    NoisePsdTracker t;
+    t.init(bins, hopSec);
+
+    std::vector<float> magSq((size_t)bins), out((size_t)bins, 0.0f);
+    sg::Rng rng(56);
+    feedNoise(t, magSq, out, 1e-4f, (int)(3.0 / hopSec), rng);
+
+    // Step DOWN by 12 dB: fast downward adaptation during absence.
+    feedNoise(t, magSq, out, 1e-7f, (int)(0.75 / hopSec), rng);
+    float afterDown = out[(size_t)bins / 2];
+    CHECK(afterDown < 0.35e-4f);
+
+    // Reset and step UP instead from the same start. By design the tracker
+    // refuses to absorb a sustained broadband step: presence gates the fast
+    // paths and per-bin absence gating blocks the minima from rising, so
+    // gross shifts are handled by the reliability bypass instead - which is
+    // exactly what must engage here.
+    t.reset();
+    sg::Rng rng2(57);
+    feedNoise(t, magSq, out, 1e-4f, (int)(3.0 / hopSec), rng2);
+
+    const int loudRun = 40;
+    const int dipFrames = 4;
+    for (int f = 0; f < (int)(6.0 / hopSec); f++) {
+        if (f % (loudRun + dipFrames) < loudRun) {
+            for (auto& v : magSq) { v = 1e-2f * (1.0f + 0.3f * rng2.gaussian()); }
+        } else {
+            for (auto& v : magSq) { v = 1e-4f; }
+        }
+        t.process(magSq.data(), out.data());
+    }
+
+    // The floor did not chase a 40 dB step, and the bypass flag fired.
+    CHECK(out[(size_t)bins / 2] < 3.0e-4f);
+    CHECK(!t.reliable());
+}
+
 int main() {
     return tf::runAll();
 }
