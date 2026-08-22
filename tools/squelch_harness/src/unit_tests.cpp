@@ -1121,6 +1121,149 @@ TEST(export_triplet_round_trips_through_wav_io) {
     std::remove("/tmp/squelch_tri_proc.wav");
 }
 
+#include <dsp/audio/voice_bandpass.h>
+
+using dsp::audio::VoiceBandpass;
+
+// Feeds a steady tone through the bandpass in one call, discards the filter
+// transient plus its group delay, and returns the gain over the known input
+// amplitude.
+static double bpToneGainDb(VoiceBandpass& bp, double fs, double freqHz, double amp = 0.5) {
+    const long n = (long)(fs * 1.2);
+    std::vector<dsp::stereo_t> in((size_t)n);
+    for (long i = 0; i < n; i++) {
+        float v = amp * std::sin(6.283185307179586 * freqHz * (double)i / fs);
+        in[(size_t)i] = dsp::stereo_t{ v, v };
+    }
+    std::vector<dsp::stereo_t> out((size_t)n);
+    bp.process((int)n, in.data(), out.data());
+
+    const long skip = bp.delaySamples() + (long)bp.tapCount() + 64;
+    double sum = 0.0;
+    long cnt = 0;
+    for (long i = skip; i + 8 < n; i++) {
+        sum += (double)out[(size_t)i].l * out[(size_t)i].l;
+        cnt++;
+    }
+    double outRms = std::sqrt(sum / (double)cnt);
+    double inRms = amp / std::sqrt(2.0);
+    return 20.0 * std::log10(outRms / inRms);
+}
+
+TEST(bandpass_passband_is_flat_within_1_db) {
+    const double probes[] = { 500.0, 900.0, 1500.0, 2100.0 };
+    for (double f : probes) {
+        VoiceBandpass bp;
+        bp.init(NULL, 48000.0);
+        double g = bpToneGainDb(bp, 48000.0, f);
+        CHECK_NEAR(g, 0.0, 1.0);
+    }
+}
+
+TEST(bandpass_rejects_the_stopbands_by_40_db) {
+    const double rejects[] = { 150.0, 3100.0, 3400.0 };
+    for (double f : rejects) {
+        VoiceBandpass bp;
+        bp.init(NULL, 48000.0);
+        CHECK(bpToneGainDb(bp, 48000.0, f) <= -40.0);
+    }
+}
+
+TEST(bandpass_impulse_response_is_centered_on_the_reported_delay) {
+    VoiceBandpass bp;
+    bp.init(NULL, 48000.0);
+    // Linear-phase windowed sinc: odd tap count, integer group delay.
+    CHECK_EQ(bp.tapCount() % 2, 1);
+    CHECK_EQ(bp.delaySamples(), (bp.tapCount() - 1) / 2);
+
+    const int n = bp.delaySamples() * 4 + 256;
+    std::vector<dsp::stereo_t> in((size_t)n, dsp::stereo_t{ 0.0f, 0.0f });
+    in[(size_t)bp.delaySamples()] = dsp::stereo_t{ 1.0f, 1.0f };
+    std::vector<dsp::stereo_t> out((size_t)n);
+    bp.process(n, in.data(), out.data());
+
+    // The magnitude peak of a modulated sinc need not sit on the group-delay
+    // sample - the carrier can cross zero there. The exact invariant of a
+    // symmetric Type-I response is its energy centroid.
+    double num = 0.0, den = 0.0;
+    float peakMag = 0.0f;
+    for (int i = 0; i < n; i++) {
+        double m = (double)out[(size_t)i].l * out[(size_t)i].l;
+        num += (double)i * m;
+        den += m;
+        float a = std::fabs(out[(size_t)i].l);
+        if (a > peakMag) { peakMag = a; }
+    }
+    CHECK(den > 0.0);
+    CHECK_NEAR(num / den, 2.0 * bp.delaySamples(), 0.01);   // input delay + group delay
+    CHECK_NEAR(peakMag, bp.tapsPeak(), 1e-3);
+}
+
+TEST(bandpass_output_is_independent_of_chunking) {
+    sg::Rng rng(31);
+    const long n = 200000;
+    std::vector<dsp::stereo_t> in((size_t)n);
+    for (auto& s : in) { s = dsp::stereo_t{ rng.gaussian() * 0.05f, rng.gaussian() * 0.05f }; }
+
+    VoiceBandpass whole;
+    whole.init(NULL, 48000.0);
+    std::vector<dsp::stereo_t> outW((size_t)n);
+    whole.process((int)n, in.data(), outW.data());
+
+    VoiceBandpass chunked;
+    chunked.init(NULL, 48000.0);
+    std::vector<dsp::stereo_t> outC((size_t)n);
+    long pos = 0;
+    while (pos < n) {
+        int take = 1 + (int)(rng.uniform() * 8192.0f);
+        if (pos + take > n) { take = (int)(n - pos); }
+        chunked.process(take, in.data() + pos, outC.data() + pos);
+        pos += take;
+    }
+
+    bool identical = true;
+    for (long i = 0; identical && i < n; i++) {
+        if (outW[(size_t)i].l != outC[(size_t)i].l || outW[(size_t)i].r != outC[(size_t)i].r) {
+            identical = false;
+        }
+    }
+    CHECK(identical);
+}
+
+TEST(bandpass_response_follows_samplerate_in_hz_domain) {
+    const double rates[] = { 16000.0, 32000.0, 48000.0 };
+    double firstGain = 0.0;
+    for (int r = 0; r < 3; r++) {
+        VoiceBandpass bp;
+        bp.init(NULL, rates[r]);
+        double g = bpToneGainDb(bp, rates[r], 1200.0);
+        if (r == 0) { firstGain = g; }
+        CHECK_NEAR(g, firstGain, 1.0);
+    }
+}
+
+TEST(bandpass_reset_clears_history) {
+    VoiceBandpass bp;
+    bp.init(NULL, 48000.0);
+
+    const long n = 4800;
+    std::vector<dsp::stereo_t> loud((size_t)n);
+    for (long i = 0; i < n; i++) {
+        float v = 0.9f * std::sin(6.283185307179586 * 1000.0 * (double)i / 48000.0);
+        loud[(size_t)i] = dsp::stereo_t{ v, v };
+    }
+    std::vector<dsp::stereo_t> out((size_t)n);
+    bp.process((int)n, loud.data(), out.data());
+    bp.reset();
+
+    std::vector<dsp::stereo_t> silence((size_t)n, dsp::stereo_t{ 0.0f, 0.0f });
+    std::vector<dsp::stereo_t> after((size_t)n);
+    bp.process((int)n, silence.data(), after.data());
+    for (long i = 0; i < n; i++) {
+        CHECK(std::fabs(after[(size_t)i].l) < 1e-9);
+    }
+}
+
 int main() {
     return tf::runAll();
 }
