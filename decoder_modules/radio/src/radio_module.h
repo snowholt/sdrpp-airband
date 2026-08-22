@@ -9,6 +9,7 @@
 #include <dsp/noise_reduction/noise_blanker.h>
 #include <dsp/noise_reduction/fm_if.h>
 #include <dsp/noise_reduction/power_squelch.h>
+#include <dsp/noise_reduction/adaptive_squelch.h>
 #include <dsp/noise_reduction/ctcss_squelch.h>
 #include <dsp/multirate/rational_resampler.h>
 #include <dsp/filter/deephasis.h>
@@ -52,11 +53,15 @@ public:
 
         squelchModes.define("off", "Off", SQUELCH_MODE_OFF);
         squelchModes.define("power", "Power", SQUELCH_MODE_POWER);
-        //squelchModes.define("snr", "SNR", SQUELCH_MODE_SNR);
+        squelchModes.define("snr", "SNR", SQUELCH_MODE_SNR);
         squelchModes.define("ctcss_mute", "CTCSS (Mute)", SQUELCH_MODE_CTCSS_MUTE);
         squelchModes.define("ctcss_decode", "CTCSS (Decode Only)", SQUELCH_MODE_CTCSS_DECODE);
         //squelchModes.define("dcs_mute", "DCS (Mute)", SQUELCH_MODE_DCS_MUTE);
         //squelchModes.define("dcs_decode", "DCS (Decode Only)", SQUELCH_MODE_DCS_DECODE);
+
+        squelchEstimators.define("percentile", "Percentile (recommended)", (int)dsp::noise_reduction::adaptive::ESTIMATOR_PERCENTILE);
+        squelchEstimators.define("mcra", "Adaptive tracker", (int)dsp::noise_reduction::adaptive::ESTIMATOR_MCRA);
+        squelchEstimators.define("gated_ema", "Gated average (basic)", (int)dsp::noise_reduction::adaptive::ESTIMATOR_GATED_EMA);
 
         for (int i = 0; i < dsp::noise_reduction::_CTCSS_TONE_COUNT; i++) {
             float tone = dsp::noise_reduction::CTCSS_TONES[i];
@@ -90,9 +95,11 @@ public:
         nb.init(NULL, 500.0 / 24000.0, 10.0);
         fmnr.init(NULL, 32);
         powerSquelch.init(NULL, MIN_SQUELCH);
+        adaptiveSquelch.init(NULL, 48000.0);
 
         ifChain.addBlock(&nb, false);
         ifChain.addBlock(&powerSquelch, false);
+        ifChain.addBlock(&adaptiveSquelch, false);
         ifChain.addBlock(&fmnr, false);
 
         // Initialize audio DSP chain
@@ -271,6 +278,39 @@ private:
                 }
                 break;
 
+            case SQUELCH_MODE_SNR:
+                ImGui::LeftLabel("Squelch Margin");
+                ImGui::FillWidth();
+                if (ImGui::SliderFloat(("##_radio_sqelch_margin_" + _this->name).c_str(), &_this->squelchMargin, _this->MIN_SQUELCH_MARGIN, _this->MAX_SQUELCH_MARGIN, "%.1f dB above noise")) {
+                    _this->setSquelchMargin(_this->squelchMargin);
+                }
+                ImGui::LeftLabel("Hysteresis");
+                ImGui::FillWidth();
+                if (ImGui::SliderFloat(("##_radio_sqelch_hyst_" + _this->name).c_str(), &_this->squelchHysteresis, 0.0f, 12.0f, "%.1f dB")) {
+                    _this->setSquelchHysteresis(_this->squelchHysteresis);
+                }
+                ImGui::LeftLabel("Hang");
+                ImGui::FillWidth();
+                if (ImGui::SliderFloat(("##_radio_sqelch_hang_" + _this->name).c_str(), &_this->squelchHangMs, 0.0f, 1000.0f, "%.0f ms")) {
+                    _this->setSquelchHang(_this->squelchHangMs);
+                }
+                ImGui::LeftLabel("Pre-roll");
+                ImGui::FillWidth();
+                if (ImGui::SliderFloat(("##_radio_sqelch_preroll_" + _this->name).c_str(), &_this->squelchPreRollMs, 0.0f, 200.0f, "%.0f ms")) {
+                    _this->setSquelchPreRoll(_this->squelchPreRollMs);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Delays the audio by this amount so the start of a\n"
+                                      "transmission is not cut off. Set to 0 for the lowest\n"
+                                      "latency, at the cost of clipped word beginnings.");
+                }
+                ImGui::LeftLabel("Noise Estimator");
+                ImGui::FillWidth();
+                if (ImGui::Combo(("##_radio_sqelch_est_" + _this->name).c_str(), &_this->squelchEstimatorId, _this->squelchEstimators.txt)) {
+                    _this->setSquelchEstimator(_this->squelchEstimatorId);
+                }
+                break;
+
             case SQUELCH_MODE_CTCSS_MUTE:
                 if (_this->squelchModes[_this->squelchModeId] == SQUELCH_MODE_CTCSS_MUTE) {
                     ImGui::LeftLabel("CTCSS Tone");
@@ -354,6 +394,33 @@ private:
                 }
                 else {
                     ImGui::TextUnformatted("None");
+                }
+            }
+            break;
+
+        case SQUELCH_MODE_SNR:
+            {
+                auto d = _this->adaptiveSquelch.diagnostics();
+                ImGui::Text("Noise floor: %.1f dB", d.noiseFloorDb);
+                ImGui::Text("SNR: %.1f dB", d.snrDb);
+                ImGui::TextUnformatted("Gate:");
+                ImGui::SameLine();
+                if (d.state == (int)dsp::noise_reduction::adaptive::GATE_OPEN ||
+                    d.state == (int)dsp::noise_reduction::adaptive::GATE_HANG) {
+                    ImGui::TextColored(ImVec4(0, 1, 0, 1), "%s",
+                        dsp::noise_reduction::adaptive::stateName((dsp::noise_reduction::adaptive::GateState)d.state));
+                }
+                else {
+                    ImGui::TextUnformatted(
+                        dsp::noise_reduction::adaptive::stateName((dsp::noise_reduction::adaptive::GateState)d.state));
+                }
+                if (d.occupancy > 0.8f) {
+                    ImGui::TextColored(ImVec4(1, 0.6f, 0, 1), "Channel busy %.0f%%", d.occupancy * 100.0f);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("This channel is transmitting almost continuously, so there\n"
+                                          "is not enough quiet time to measure the noise floor.\n"
+                                          "Use the Power squelch mode with a fixed level instead.");
+                    }
                 }
             }
             break;
@@ -444,6 +511,11 @@ private:
         deempId = deempModes.valueId((DeemphasisMode)selectedDemod->getDefaultDeemphasisMode());
         squelchModeId = squelchModes.valueId(SQUELCH_MODE_OFF);
         squelchLevel = MIN_SQUELCH;
+        squelchMargin = 9.5f;
+        squelchHysteresis = 3.0f;
+        squelchHangMs = 200.0f;
+        squelchPreRollMs = 40.0f;
+        squelchEstimatorId = squelchEstimators.keyId("percentile");
         ctcssToneId = ctcssTones.valueId(dsp::noise_reduction::CTCSS_TONE_67Hz);
         highPass = false;
 
@@ -474,6 +546,24 @@ private:
         }
         if (config.conf[name][selectedDemod->getName()].contains("squelchLevel")) {
             squelchLevel = config.conf[name][selectedDemod->getName()]["squelchLevel"];
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("squelchMargin")) {
+            squelchMargin = config.conf[name][selectedDemod->getName()]["squelchMargin"];
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("squelchHysteresis")) {
+            squelchHysteresis = config.conf[name][selectedDemod->getName()]["squelchHysteresis"];
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("squelchHang")) {
+            squelchHangMs = config.conf[name][selectedDemod->getName()]["squelchHang"];
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("squelchPreRoll")) {
+            squelchPreRollMs = config.conf[name][selectedDemod->getName()]["squelchPreRoll"];
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("squelchEstimator")) {
+            std::string est = config.conf[name][selectedDemod->getName()]["squelchEstimator"];
+            if (squelchEstimators.keyExists(est)) {
+                squelchEstimatorId = squelchEstimators.keyId(est);
+            }
         }
         if (config.conf[name][selectedDemod->getName()].contains("ctcssTone")) {
             int ctcssToneX10 = config.conf[name][selectedDemod->getName()]["ctcssTone"];
@@ -519,6 +609,10 @@ private:
             vfo->setSampleRate(ifSamplerate, bandwidth);
         }
 
+        // The noise floor estimate is only meaningful for one samplerate and
+        // one channel bandwidth. Both just changed.
+        adaptiveSquelch.setSamplerate(ifSamplerate);
+
         // Configure bandwidth
         setBandwidth(bandwidth);
 
@@ -532,6 +626,11 @@ private:
         setFMIFNREnabled(FMIFNRAllowed ? FMIFNREnabled : false);
 
         // Configure squelch
+        setSquelchEstimator(squelchEstimatorId);
+        setSquelchMargin(squelchMargin);
+        setSquelchHysteresis(squelchHysteresis);
+        setSquelchHang(squelchHangMs);
+        setSquelchPreRoll(squelchPreRollMs);
         setSquelchMode(squelchAllowed ? squelchModes[squelchModeId] : SQUELCH_MODE_OFF);
         setSquelchLevel(squelchLevel);
         setCTCSSTone(ctcssTones[ctcssToneId]);
@@ -569,6 +668,10 @@ private:
         vfo->setBandwidth(bandwidth);
         selectedDemod->setBandwidth(bandwidth);
 
+        // A bandwidth change alters the noise power reaching the block, so the
+        // stored floor is stale by exactly 10*log10(newBw/oldBw).
+        adaptiveSquelch.reset();
+
         config.acquire();
         config.conf[name][selectedDemod->getName()]["bandwidth"] = bandwidth;
         config.release(true);
@@ -585,6 +688,7 @@ private:
             bandwidth = selectedDemod->getIFSampleRate();
             vfo->setBandwidthLimits(minBandwidth, maxBandwidth, selectedDemod->getBandwidthLocked());
             vfo->setSampleRate(selectedDemod->getIFSampleRate(), bandwidth);
+            adaptiveSquelch.setSamplerate(selectedDemod->getIFSampleRate());
             return;
         }
 
@@ -660,6 +764,7 @@ private:
 
         // Disable all squelch blocks
         ifChain.disableBlock(&powerSquelch, [=](dsp::stream<dsp::complex_t>* out){ selectedDemod->setInput(out); });
+        ifChain.disableBlock(&adaptiveSquelch, [=](dsp::stream<dsp::complex_t>* out){ selectedDemod->setInput(out); });
         afChain.disableBlock(&ctcss, [=](dsp::stream<dsp::stereo_t>* out){ stream.setInput(out); });
 
         // Enable the block depending on the mode
@@ -673,7 +778,11 @@ private:
             break;
 
         case SQUELCH_MODE_SNR:
-            // TODO
+            // Enable the adaptive squelch block. Its state is cleared on entry
+            // because a floor estimated in a previous mode, band or gain
+            // setting is not valid here.
+            adaptiveSquelch.reset();
+            ifChain.enableBlock(&adaptiveSquelch, [=](dsp::stream<dsp::complex_t>* out){ selectedDemod->setInput(out); });
             break;
 
         case SQUELCH_MODE_CTCSS_MUTE:
@@ -700,6 +809,51 @@ private:
         // Save config
         config.acquire();
         config.conf[name][selectedDemod->getName()]["squelchMode"] = squelchModes.key(squelchModeId);
+        config.release(true);
+    }
+
+    void setSquelchMargin(float margin) {
+        squelchMargin = std::clamp<float>(margin, MIN_SQUELCH_MARGIN, MAX_SQUELCH_MARGIN);
+        adaptiveSquelch.setOpenMargin(squelchMargin);
+        if (!selectedDemod) { return; }
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["squelchMargin"] = squelchMargin;
+        config.release(true);
+    }
+
+    void setSquelchHysteresis(float dB) {
+        squelchHysteresis = std::clamp<float>(dB, 0.0f, 12.0f);
+        adaptiveSquelch.setHysteresis(squelchHysteresis);
+        if (!selectedDemod) { return; }
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["squelchHysteresis"] = squelchHysteresis;
+        config.release(true);
+    }
+
+    void setSquelchHang(float ms) {
+        squelchHangMs = std::clamp<float>(ms, 0.0f, 2000.0f);
+        adaptiveSquelch.setHang((double)squelchHangMs / 1000.0);
+        if (!selectedDemod) { return; }
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["squelchHang"] = squelchHangMs;
+        config.release(true);
+    }
+
+    void setSquelchPreRoll(float ms) {
+        squelchPreRollMs = std::clamp<float>(ms, 0.0f, 250.0f);
+        adaptiveSquelch.setPreRoll((double)squelchPreRollMs / 1000.0);
+        if (!selectedDemod) { return; }
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["squelchPreRoll"] = squelchPreRollMs;
+        config.release(true);
+    }
+
+    void setSquelchEstimator(int estimatorId) {
+        squelchEstimatorId = estimatorId;
+        adaptiveSquelch.setEstimator((dsp::noise_reduction::adaptive::EstimatorType)squelchEstimators[estimatorId]);
+        if (!selectedDemod) { return; }
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["squelchEstimator"] = squelchEstimators.key(estimatorId);
         config.release(true);
     }
 
@@ -886,6 +1040,22 @@ private:
     float squelchLevel;
     int ctcssToneId = 0;
     bool squelchAllowed = false;
+
+    dsp::noise_reduction::AdaptiveSquelch adaptiveSquelch;
+
+    const float MIN_SQUELCH_MARGIN = 0.0f;
+    const float MAX_SQUELCH_MARGIN = 30.0f;
+
+    // Defaults from the design spec, section 8. The open margin is the one
+    // value with a cited source: RTLSDR-Airband opens at about 10 dB above its
+    // estimated noise floor and its documented default SNR threshold is
+    // 9.54 dB. Everything else is a starting point to be tuned on recordings.
+    float squelchMargin = 9.5f;
+    float squelchHysteresis = 3.0f;
+    float squelchHangMs = 200.0f;
+    float squelchPreRollMs = 40.0f;
+    int squelchEstimatorId = 0;
+    OptionList<std::string, int> squelchEstimators;
 
     bool highPass = false;
     bool highPassAllowed = false;
