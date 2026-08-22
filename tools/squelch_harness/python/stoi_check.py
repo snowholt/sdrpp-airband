@@ -185,10 +185,9 @@ def stoi(ref, test, fs):
         if not valid.any():
             continue
         rho = num[valid] / (nx[valid] * ny[valid])
-        d.append(np.clip(rho, 0.0, 1.0))
+        d.extend(np.clip(rho, 0.0, 1.0).tolist())
 
-    d = np.array(d)                       # (segments, bands)
-    return float(np.mean(d ** BETA))
+    return float(np.mean(np.array(d) ** BETA))
 
 
 def _crosscheck_pystoi(ref, test, fs):

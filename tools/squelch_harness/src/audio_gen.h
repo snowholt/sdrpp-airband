@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 #include "signal_gen.h"
+#include <dsp/taps/band_pass.h>
 
 // Deterministic audio-band scenes for the AM chain tests: formant-synthesized
 // "speech" inside ground-truth transmission and word labels, plus white
@@ -15,6 +16,13 @@
 // resonator bank), shaped by word envelopes. It carries enough spectral
 // structure for STOI-style correlation metrics and for human transcription
 // in the listening protocol, without pretending to be real speech.
+//
+// The clean signal is band-limited to 300-3400 Hz after synthesis. This
+// models the transmitter, not the listener: land mobile transmitters are
+// band-limited to that range by ETSI EN 300 086, so any evaluation of
+// receiver-side filtering must not credit or penalise content the channel
+// never carried. The noise is deliberately NOT band-limited - it represents
+// demodulated receiver hiss, which is wideband.
 namespace ag {
 
     struct AudioSceneConfig {
@@ -34,6 +42,18 @@ namespace ag {
         std::vector<sg::Label> txLabels;
         std::vector<sg::Label> wordLabels;
         double rate = 0.0;
+
+        // Phoneme-like sub-segments of each word. Voiced segments carry the
+        // pitched source; unvoiced ones carry shaped broadband noise, which
+        // is what gives real speech its spectral spread. Without them every
+        // third-octave band above the formants would be empty and correlation
+        // metrics would see per-band SNRs far above the nominal scene SNR.
+        struct Phoneme {
+            long start;
+            long end;
+            bool voiced;
+        };
+        std::vector<Phoneme> phonemes;
     };
 
     namespace agdetail {
@@ -122,9 +142,27 @@ namespace ag {
             }
         }
 
-        // ---- voiced source -------------------------------------------------
+        // ---- voiced and unvoiced source ------------------------------------
         agdetail::FormantVoice voice;
         voice.init(cfg.rate);
+
+        // Phoneme schedule: each word alternates voiced and unvoiced segments
+        // of 60-150 ms, starting with a voiced one. Deterministic through the
+        // same RNG stream as everything else.
+        {
+            bool voiced = true;
+            for (auto& w : s.wordLabels) {
+                long cursor = w.start;
+                while (cursor < w.end) {
+                    long len = (long)std::llround((0.06 + rng.uniform() * 0.09) * cfg.rate);
+                    if (cursor + len > w.end) { len = w.end - cursor; }
+                    if (len <= 0) { break; }
+                    s.phonemes.push_back({ cursor, cursor + len, voiced });
+                    cursor += len;
+                    voiced = !voiced;
+                }
+            }
+        }
 
         // Raised-cosine edge tables keep the ground truth click-free.
         const int edge = (int)std::llround(0.010 * cfg.rate);
@@ -152,6 +190,9 @@ namespace ag {
         double phase = 0.0;
         double outScale = 0.0;
 
+        size_t phonemeIdx = 0;
+        bool currentVoiced = true;
+
         // First pass: synthesize into the vector, tracking the peak.
         for (long i = 0; i < n; i++) {
             const double t = (double)i / cfg.rate;
@@ -164,6 +205,18 @@ namespace ag {
             phase += f0 / cfg.rate;
             double exc = 0.0;
             if (phase >= 1.0) { phase -= 1.0; exc = 1.0; }
+
+            while (phonemeIdx < s.phonemes.size() && i >= s.phonemes[phonemeIdx].end) {
+                phonemeIdx++;
+            }
+            if (phonemeIdx < s.phonemes.size() && i >= s.phonemes[phonemeIdx].start) {
+                currentVoiced = s.phonemes[phonemeIdx].voiced;
+            } else {
+                currentVoiced = false;
+            }
+            // Unvoiced excitation: broadband noise through the same formant
+            // bank, at a level that keeps the word loudness roughly even.
+            if (!currentVoiced) { exc = (rng.uniform() - 0.5) * 2.0 * 0.12; }
 
             float env = envelopeAt(i);
             if (env != 0.0f) {
@@ -185,7 +238,42 @@ namespace ag {
         const float norm = (float)(0.35 / outScale);
         for (auto& v : s.clean) { v *= norm; }
 
+        // ---- transmitter band shaping (EN 300 086: 300-3400 Hz) ------------
+        // Convolve with the shaping FIR and keep the centre section so sample
+        // indices - and therefore every label - stay exactly aligned.
+        {
+            dsp::tap<float> shape = dsp::taps::bandPass<float>(
+                300.0, 3400.0, 200.0, cfg.rate, true);
+            const int taps = (int)shape.size;
+            const int delay = (taps - 1) / 2;
+            std::vector<float> shaped((size_t)n, 0.0f);
+            for (long i = 0; i < n; i++) {
+                double acc = 0.0;
+                const long base = i - taps + 1 + delay;   // compensates group delay
+                for (int k = 0; k < taps; k++) {
+                    long idx = base + k;
+                    if (idx < 0 || idx >= n) { continue; }
+                    acc += (double)shape.taps[k] * s.clean[(size_t)idx];
+                }
+                shaped[(size_t)i] = (float)acc;
+            }
+            s.clean.swap(shaped);
+
+            // Re-normalise after the filter removed some energy.
+            double peak = 0.0;
+            for (float v : s.clean) { double a = v < 0 ? -(double)v : (double)v; if (a > peak) { peak = a; } }
+            if (peak > 0.0) {
+                const float renorm = (float)(0.35 / peak);
+                for (auto& v : s.clean) { v *= renorm; }
+            }
+        }
+
         // ---- noise at the requested active SNR -----------------------------
+        // snrDb is defined INSIDE the transmitted 300-3400 Hz channel - the
+        // way airband performance figures are quoted - not over the full
+        // synthesis band. Physically the hiss stays wideband; hitting the
+        // in-band target with white noise therefore needs a higher full-band
+        // power, by exactly the band fraction.
         double speechPower = 0.0;
         long speechN = 0;
         for (auto& w : s.wordLabels) {
@@ -198,7 +286,11 @@ namespace ag {
         speechPower /= (double)speechN;
 
         const double snrLin = std::pow(10.0, cfg.snrDb / 10.0);
-        const double noisePower = (speechPower > 0.0) ? speechPower / snrLin : 0.0;
+        const double channelBandFraction = 3100.0 / cfg.rate;   // 300-3400 Hz
+        const double noisePower =
+            (speechPower > 0.0)
+                ? (speechPower / snrLin) / channelBandFraction
+                : 0.0;
         const float sigma = (float)std::sqrt(noisePower);
 
         s.noisy.resize((size_t)n);
