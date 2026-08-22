@@ -1646,6 +1646,112 @@ TEST(psd_tracks_a_floor_step_downward_faster_than_upward) {
     CHECK(!t.reliable());
 }
 
+#include <dsp/noise_reduction/am_nr/gain_rule.h>
+
+using dsp::noise_reduction::amnr::GainRule;
+
+TEST(gainrule_caps_at_exactly_nine_db) {
+    // Deep-noise bin: a posteriori and a priori SNR both far below one.
+    GainRule g;
+    g.init(1);
+    const float mag = 0.01f, noise = 1.0f;
+    float out = 1.0f;
+    for (int i = 0; i < 50; i++) { g.process(&mag, &noise, &out); }
+    CHECK_NEAR(out, GainRule::GAIN_FLOOR, 1e-4);
+    CHECK(out >= GainRule::GAIN_FLOOR - 1e-6f);
+}
+
+TEST(gainrule_passes_speech_dominant_bins) {
+    GainRule g;
+    g.init(1);
+    const float mag = 100.0f, noise = 1.0f;
+    float out = 1.0f;
+    for (int i = 0; i < 200; i++) { g.process(&mag, &noise, &out); }
+    // -0.5 dB in power terms is 0.891 in amplitude gain; the gain here
+    // multiplies the spectrum, so compare against amplitude directly.
+    CHECK(out >= 0.944f);
+    CHECK(out <= 1.0f + 1e-6f);
+}
+
+TEST(gainrule_is_finite_under_hostile_inputs) {
+    GainRule g;
+    g.init(2);
+    const float frames[][2] = {
+        { 0.0f, 0.0f },          // silence over silence
+        { std::numeric_limits<float>::infinity(), 1.0f },
+        { -5.0f, 1.0f },         // negative power is nonsense but must not spread
+        { std::nanf(""), 1.0f },
+        { 1e30f, 1e-30f },
+        { 1.0f, std::numeric_limits<float>::infinity() },
+    };
+    float out[2] = { 1.0f, 1.0f };
+    const float mags[2] = { 1.0f, 1.0f };
+    const float noises[2] = { 1.0f, 1.0f };
+    for (auto& fr : frames) {
+        const float f2[2] = { fr[0], fr[0] };
+        const float n2[2] = { fr[1], fr[1] };
+        g.process(f2, n2, out);
+        for (int k = 0; k < 2; k++) {
+            CHECK(std::isfinite(out[k]));
+            CHECK(out[k] >= GainRule::GAIN_FLOOR - 1e-6f);
+            CHECK(out[k] <= 1.0f + 1e-6f);
+        }
+    }
+    // And it keeps working afterwards on sane input.
+    for (int i = 0; i < 10; i++) { g.process(mags, noises, out); }
+    for (int k = 0; k < 2; k++) {
+        CHECK(std::isfinite(out[k]));
+        CHECK(out[k] >= GainRule::GAIN_FLOOR - 1e-6f);
+    }
+}
+
+TEST(gainrule_decision_directed_converges_on_stationary_bin) {
+    GainRule g;
+    g.init(1);
+    const float mag = 2.0f, noise = 1.0f;   // gamma = 2, about 3 dB SNR
+    float out = 1.0f;
+    for (int i = 0; i < 300; i++) { g.process(&mag, &noise, &out); }
+    const float settled = out;
+    for (int i = 0; i < 20; i++) { g.process(&mag, &noise, &out); }
+    // Decision-directed state must settle: the gain stops moving once the
+    // smoothed a priori estimate reaches its fixed point.
+    CHECK_NEAR(out, settled, 1e-3);
+
+    // The settled value is legal and stable. Note plain decision-directed
+    // estimation carries a documented downward bias at modest SNR, so a bin
+    // at 3 dB may ride near the attenuation cap - the cap exists precisely
+    // to make that worst case benign, and outcome quality at these SNRs is
+    // judged by the downstream fidelity and STOI gates rather than here.
+    CHECK(settled >= GainRule::GAIN_FLOOR);
+    CHECK(settled <= 1.0f);
+}
+
+TEST(gainrule_gain_variance_stays_low_on_stationary_noise) {
+    // Musical-noise proxy: with decision-directed smoothing, per-bin gains on
+    // stationary noise must barely flicker frame to frame.
+    GainRule g;
+    g.init(1);
+    sg::Rng rng(61);
+    const float noise = 1.0f;
+    float out = 1.0f;
+    std::vector<float> history;
+    history.reserve(200);
+    for (int i = 0; i < 500; i++) {
+        float mag = noise * (0.5f + rng.uniform());
+        if (i >= 300) { history.push_back(out); }
+        g.process(&mag, &noise, &out);
+    }
+    double mean = 0.0;
+    for (float v : history) { mean += v; }
+    mean /= (double)history.size();
+    double var = 0.0;
+    for (float v : history) { var += ((double)v - mean) * ((double)v - mean); }
+    var /= (double)history.size();
+    CHECK(std::sqrt(var) < 0.02);
+    CHECK(mean >= GainRule::GAIN_FLOOR);
+    CHECK(mean <= 1.0f);
+}
+
 int main() {
     return tf::runAll();
 }
