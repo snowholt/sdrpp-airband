@@ -20,6 +20,10 @@ namespace dsp::audio {
     class VoiceBandpass : public filter::FIR<dsp::stereo_t, float> {
         using base_type = filter::FIR<dsp::stereo_t, float>;
     public:
+        // The samplerate/cutoff init overload intentionally coexists with
+        // the base class tap-based init; keep both visible to callers.
+        using base_type::init;
+
         static constexpr double DEFAULT_LOW_HZ = 300.0;
         static constexpr double DEFAULT_HIGH_HZ = 2700.0;
         static constexpr double TRANS_WIDTH_HZ = 200.0;

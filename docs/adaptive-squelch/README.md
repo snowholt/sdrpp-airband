@@ -5,11 +5,23 @@ Design record for the first feature of this project.
 | Document | What it is |
 |---|---|
 | [`design.md`](design.md) | The specification. What is being built, and **why each decision was made and what was rejected**. Section 2 records decisions that reverse earlier positions; read it before proposing changes. |
-| [`implementation-plan.md`](implementation-plan.md) | Twelve test-driven tasks with the exact files, tests, code and commands. Its appendix holds a reference sweep produced by compiling and running the plan's own code. |
+| [`implementation-plan.md`](implementation-plan.md) | Twelve test-driven tasks with the exact files, tests, code and commands for the offline harness and the `AdaptiveSquelch` block. Its appendix holds a reference sweep produced by compiling and running the plan's own code. |
+| [`implementation-plan-phase2.md`](implementation-plan-phase2.md) | The Phase 2 plan: AM voice bandpass (2a) then capped log-MMSE noise reduction (2b), with the intelligibility release gate. |
 
 ## Status
 
-Design complete. Implementation not started.
+Phase 0 and Phase 1 complete: harness plus SNR squelch shipped on
+`main`. Phase 2 complete on `feature/am-audio-chain`: the AM voice
+bandpass passes its gate at every tested SNR; the noise reduction
+delivers near-cap suppression at low SNR but FAILED the intelligibility
+gate there by 0.001-0.013 STOI against its baselines, so it ships opt-in
+and OFF behind its checkbox until a candidate passes
+`phase2-abx-protocol.md`. Measurements:
+[`phase2-bandpass-sweep.txt`](phase2-bandpass-sweep.txt),
+[`phase2-nr-sweep.txt`](phase2-nr-sweep.txt).
+
+RNNoise remains research-only pending an A3E-domain intelligibility study
+(design §7 2c; Valin 2018).
 
 ## Scope
 
