@@ -87,16 +87,23 @@ namespace dsp::noise_reduction::amnr {
                 while (_totalIn >= _nextFrameStart + _n) {
                     runFrame();
                     _nextFrameStart += _hop;
+                }
 
-                    while (_totalOut < _nextFrameStart && emitted < count) {
-                        const size_t oslot = (size_t)(_totalOut % (2 * _n));
-                        out[emitted].l = _accL[oslot];
-                        out[emitted].r = _accR[oslot];
-                        _accL[oslot] = 0.0f;
-                        _accR[oslot] = 0.0f;
-                        _totalOut++;
-                        emitted++;
-                    }
+                // Drain whenever anything is final - NOT only on frame
+                // triggers. Draining inside the trigger branch alone lets
+                // callers delivering sub-hop chunks starve emission: the
+                // finalized backlog grows, and the overlap-add ring
+                // eventually overwrites its own pending tail. Per-sample
+                // draining keeps the write frontier from ever lapping the
+                // read frontier within the ring's two-frame span.
+                while (_totalOut < _nextFrameStart && emitted < count) {
+                    const size_t oslot = (size_t)(_totalOut % (2 * _n));
+                    out[emitted].l = _accL[oslot];
+                    out[emitted].r = _accR[oslot];
+                    _accL[oslot] = 0.0f;
+                    _accR[oslot] = 0.0f;
+                    _totalOut++;
+                    emitted++;
                 }
             }
             return emitted;
