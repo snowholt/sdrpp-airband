@@ -149,4 +149,109 @@ namespace dsp::noise_reduction::adaptive {
         int _filled = 0;
         float _lastEstimate = MIN_DB;
     };
+
+    // One-pole smoothing coefficient for a given time constant.
+    inline float alphaFor(double tauSeconds, double frameSeconds) {
+        if (tauSeconds <= 0.0) { return 0.0f; }
+        return (float)std::exp(-frameSeconds / tauSeconds);
+    }
+
+    // ---------------------------------------------------------------------
+    // M - minimum-guided soft recursive tracker.
+    //
+    // Follows the MCRA idea: the excess of smoothed power over a slowly
+    // tracked local minimum drives a presence probability, and that
+    // probability throttles - but never fully stops - the noise update. That
+    // is what makes it immune to the freeze-forever failure of a hard-gated
+    // estimator.
+    //
+    // Deliberately named "inspired". The published MCRA and IMCRA results are
+    // per-frequency-bin STFT results (Cohen and Berdugo 2002; Cohen 2003) and
+    // do not transfer unchanged to a scalar broadband power envelope. Nothing
+    // here claims their bias figures.
+    // ---------------------------------------------------------------------
+    class McraEstimator : public NoiseEstimator {
+    public:
+        static constexpr float PRESENCE_DB = 4.0f;        // excess over minimum that reads as signal
+        static constexpr float IMPULSE_CLIP_DB = 20.0f;   // one sample may not move the tracker further
+        static constexpr float MAX_ABOVE_MIN_DB = 3.0f;   // watchdog ceiling above the tracked minimum
+
+        void init(double frameSeconds) override {
+            _frameSeconds = frameSeconds;
+            _aS = alphaFor(0.10, frameSeconds);      // power smoothing
+            _aP = alphaFor(0.20, frameSeconds);      // presence smoothing
+            _aFast = alphaFor(0.50, frameSeconds);   // fastest noise update, presence 0
+            _aSlow = alphaFor(30.0, frameSeconds);   // slowest leak, presence 1
+            _minWindowFrames = (int)std::lround(1.0 / frameSeconds);
+            if (_minWindowFrames < 1) { _minWindowFrames = 1; }
+            reset();
+        }
+
+        void reset() override {
+            _started = false;
+            _s = _min = _runMin = _noise = 0.0f;
+            _p = 0.0f;
+            _minCount = 0;
+        }
+
+        float update(float framePowerDb, bool /*gateOpen*/) override {
+            if (!_started) {
+                _started = true;
+                _s = _min = _runMin = _noise = framePowerDb;
+                _p = 0.0f;
+                _minCount = 0;
+                return _noise;
+            }
+
+            // Robust clipping. A single ignition pulse must not be able to drag
+            // the tracker up; it is bounded to IMPULSE_CLIP_DB above the estimate.
+            float clipped = framePowerDb;
+            const float ceiling = _noise + IMPULSE_CLIP_DB;
+            if (clipped > ceiling) { clipped = ceiling; }
+
+            _s = _aS * _s + (1.0f - _aS) * clipped;
+
+            // Two-half rolling minimum, so the minimum can rise again once the
+            // frames that produced it have expired.
+            if (_s < _runMin) { _runMin = _s; }
+            _minCount++;
+            if (_minCount >= _minWindowFrames) {
+                _min = _runMin;
+                _runMin = _s;
+                _minCount = 0;
+            }
+            if (_s < _min) { _min = _s; }
+
+            // Presence indicator, then temporal smoothing into a probability.
+            const float raw = ((_s - _min) > PRESENCE_DB) ? 1.0f : 0.0f;
+            _p = _aP * _p + (1.0f - _aP) * raw;
+
+            // Probability-controlled smoothing. alpha rises toward _aSlow with
+            // presence, so the update slows during signal without ever freezing.
+            const float aD = _aFast + (_aSlow - _aFast) * _p;
+            _noise = aD * _noise + (1.0f - aD) * clipped;
+
+            // Watchdog. The estimate may never walk more than MAX_ABOVE_MIN_DB
+            // above the tracked minimum, which bounds the runaway case where a
+            // long transmission slowly drags the floor up into the signal.
+            const float cap = _min + MAX_ABOVE_MIN_DB;
+            if (_noise > cap) { _noise = cap; }
+            return _noise;
+        }
+
+        float occupancy() const override {
+            // A cheap proxy: the smoothed presence probability.
+            return _p;
+        }
+
+        const char* name() const override { return "mcra"; }
+
+    private:
+        double _frameSeconds = 0.010;
+        float _aS = 0.0f, _aP = 0.0f, _aFast = 0.0f, _aSlow = 0.0f;
+        int _minWindowFrames = 100;
+        int _minCount = 0;
+        bool _started = false;
+        float _s = 0.0f, _min = 0.0f, _runMin = 0.0f, _p = 0.0f, _noise = 0.0f;
+    };
 }

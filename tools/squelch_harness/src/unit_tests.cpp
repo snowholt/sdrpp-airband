@@ -237,6 +237,54 @@ TEST(percentile_reset_clears_history) {
     CHECK_NEAR(n, -40.0, 0.5);
 }
 
+using dsp::noise_reduction::adaptive::McraEstimator;
+using dsp::noise_reduction::adaptive::alphaFor;
+
+TEST(alpha_for_matches_the_documented_defaults) {
+    // Spec table: tau = 0.75 s at 10 ms frames gives alpha 0.9868;
+    //             tau = 20 s at 10 ms frames gives alpha 0.99950.
+    CHECK_NEAR(alphaFor(0.75, 0.010), 0.9868, 0.0002);
+    CHECK_NEAR(alphaFor(20.0, 0.010), 0.99950, 0.00002);
+}
+
+TEST(mcra_converges_on_a_stationary_floor) {
+    McraEstimator e;
+    e.init(0.010);
+    float n = 0.0f;
+    for (int i = 0; i < 3000; i++) { n = e.update(-72.0f, false); }
+    CHECK_NEAR(n, -72.0, 1.5);
+}
+
+TEST(mcra_does_not_freeze_during_a_long_transmission) {
+    // The whole point of the soft update: the estimate slows during signal but
+    // never stops. Feed 60 s of continuous signal after the floor steps up and
+    // the estimate must still move most of the way.
+    McraEstimator e;
+    e.init(0.010);
+    for (int i = 0; i < 3000; i++) { e.update(-90.0f, false); }
+    float n = 0.0f;
+    for (int i = 0; i < 6000; i++) { n = e.update(-60.0f, true); }
+    CHECK(n > -75.0f);
+}
+
+TEST(mcra_rejects_a_single_impulse) {
+    McraEstimator e;
+    e.init(0.010);
+    for (int i = 0; i < 3000; i++) { e.update(-80.0f, false); }
+    float before = e.update(-80.0f, false);
+    e.update(20.0f, false);              // one enormous impulse
+    float after = e.update(-80.0f, false);
+    CHECK_NEAR(after, before, 1.0);
+}
+
+TEST(mcra_reset_clears_state) {
+    McraEstimator e;
+    e.init(0.010);
+    for (int i = 0; i < 3000; i++) { e.update(-100.0f, false); }
+    e.reset();
+    CHECK_NEAR(e.update(-40.0f, false), -40.0, 0.001);
+}
+
 int main() {
     return tf::runAll();
 }
